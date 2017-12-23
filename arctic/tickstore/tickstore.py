@@ -98,7 +98,7 @@ class TickStore(object):
         """
         Parameters
         ----------
-        arctic_lib : TickStore
+        arctic_lib : ArcticLibraryBinding
             Arctic Library
         chunk_size : int
             Number of ticks to store in a document before splitting to another document.
@@ -636,6 +636,12 @@ class TickStore(object):
             array = array.astype('<f8')
         elif (array.dtype.kind) in ('U', 'S'):
             array = array.astype(np.unicode_)
+        elif (array.dtype.kind) == 'O':
+            try:
+                array = np.array([s.encode('utf-8') for s in array])
+                array = array.astype(np.unicode_)
+            except:
+                raise UnhandledDtypeException("Casting object column to string failed")
         else:
             raise UnhandledDtypeException("Unsupported dtype '%s' - only int64, float64 and U are supported" % array.dtype)
         # Everything is little endian in tickstore

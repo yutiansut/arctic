@@ -1,9 +1,8 @@
+import pytest
+import time
 from datetime import datetime as dt
 from mock import patch
 from pandas.util.testing import assert_frame_equal
-import pytest
-import time
-
 
 from arctic.arctic import Arctic, VERSION_STORE
 from arctic.exceptions import LibraryNotFoundException, QuotaExceededException
@@ -27,10 +26,31 @@ def test_reset_Arctic(mongo_host, library_name):
     arctic = Arctic(mongo_host=mongo_host)
     arctic.list_libraries()
     arctic.initialize_library(library_name, VERSION_STORE)
-    arctic[library_name]
     c = arctic._conn
+    assert arctic[library_name]._arctic_lib._curr_conn is c
     arctic.reset()
+    assert c is not arctic._conn
     assert len(c.nodes) == 0
+    assert arctic[library_name]._arctic_lib._curr_conn is arctic._conn
+
+
+def test_re_authenticate_on_arctic_reset(mongo_host, library_name):
+    from collections import namedtuple
+    Cred = namedtuple('Cred', 'user, password')
+    with patch('arctic.arctic.authenticate') as auth_mock, \
+            patch('arctic.arctic.get_auth') as get_auth_mock:
+        auth_mock.return_value = True
+        get_auth_mock.return_value = Cred(user='a_username', password='a_passwd')
+        arctic = Arctic(mongo_host=mongo_host)
+        arctic.initialize_library(library_name, VERSION_STORE)
+        vstore = arctic[library_name]
+        vstore.list_symbols()
+        auth_mock.reset_mock()
+        arctic.reset()
+        assert auth_mock.call_count > 0
+        auth_mock.reset_mock()
+        vstore.list_symbols()
+        assert auth_mock.call_count == 0
 
 
 def test_simple(library):
@@ -56,54 +76,55 @@ def test_indexes(arctic):
     c = arctic._conn
     arctic.initialize_library("library", VERSION_STORE, segment='month')
     chunk = c.arctic.library.index_information()
-    assert chunk == {u'_id_': {u'key': [(u'_id', 1)], u'ns': u'arctic.library', u'v': 1},
+    index_version = chunk['_id_']['v']  # Mongo 3.2 has index v1, 3.4 and 3.5 have v2 (3.4 can run in compabitility mode with v1)
+    assert chunk == {u'_id_': {u'key': [(u'_id', 1)], u'ns': u'arctic.library', u'v': index_version},
                              u'symbol_1_parent_1_segment_1': {u'background': True,
                                                               u'key': [(u'symbol', 1),
                                                                        (u'parent', 1),
                                                                        (u'segment', 1)],
                                                               u'ns': u'arctic.library',
                                                               u'unique': True,
-                                                              u'v': 1},
+                                                              u'v': index_version},
                              u'symbol_1_sha_1': {u'background': True,
                                                  u'key': [(u'symbol', 1), (u'sha', 1)],
                                                  u'ns': u'arctic.library',
                                                  u'unique': True,
-                                                 u'v': 1},
+                                                 u'v': index_version},
                              u'symbol_hashed': {u'background': True,
                                                 u'key': [(u'symbol', u'hashed')],
                                                 u'ns': u'arctic.library',
-                                                u'v': 1}}
+                                                u'v': index_version}}
     snapshots = c.arctic.library.snapshots.index_information()
     assert snapshots == {u'_id_': {u'key': [(u'_id', 1)],
                                                u'ns': u'arctic.library.snapshots',
-                                               u'v': 1},
+                                               u'v': index_version},
                                      u'name_1': {u'background': True,
                                                  u'key': [(u'name', 1)],
                                                  u'ns': u'arctic.library.snapshots',
                                                  u'unique': True,
-                                                 u'v': 1}}
+                                                 u'v': index_version}}
     versions = c.arctic.library.versions.index_information()
     assert versions == {u'_id_': {u'key': [(u'_id', 1)],
                                            u'ns': u'arctic.library.versions',
-                                           u'v': 1},
+                                           u'v': index_version},
                                  u'symbol_1__id_-1': {u'background': True,
                                                       u'key': [(u'symbol', 1), (u'_id', -1)],
                                                       u'ns': u'arctic.library.versions',
-                                                      u'v': 1},
+                                                      u'v': index_version},
                                  u'symbol_1_version_-1': {u'background': True,
                                                           u'key': [(u'symbol', 1), (u'version', -1)],
                                                           u'ns': u'arctic.library.versions',
                                                           u'unique': True,
-                                                          u'v': 1}}
+                                                          u'v': index_version}}
     version_nums = c.arctic.library.version_nums.index_information()
     assert version_nums == {u'_id_': {u'key': [(u'_id', 1)],
                                                u'ns': u'arctic.library.version_nums',
-                                               u'v': 1},
+                                               u'v': index_version},
                                      u'symbol_1': {u'background': True,
                                                    u'key': [(u'symbol', 1)],
                                                    u'ns': u'arctic.library.version_nums',
                                                    u'unique': True,
-                                                   u'v': 1}}
+                                                   u'v': index_version}}
 
 
 def test_delete_library(arctic, library, library_name):
