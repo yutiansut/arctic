@@ -9,9 +9,15 @@ except ImportError:
     from pandas.lib import infer_dtype
 
 try:
-    from pandas._libs.lib import max_len_string_array
+    # pandas >= 0.23.0
+    from pandas._libs.writers import max_len_string_array
 except ImportError:
-    from pandas.lib import max_len_string_array
+    try:
+        # pandas [0.20.0, 0.22.x]
+        from pandas._libs.lib import max_len_string_array
+    except ImportError:
+        # pandas <=  0.19.x
+        from pandas.lib import max_len_string_array
 
 from bson import Binary, SON
 
@@ -139,15 +145,17 @@ class FrameConverter(object):
 
         for col in cols:
             d = decompress(doc[DATA][doc[METADATA][LENGTHS][col][0]: doc[METADATA][LENGTHS][col][1] + 1])
-            d = np.fromstring(d, doc[METADATA][DTYPE][col])
+            # d is ready-only but that's not an issue since DataFrame will copy the data anyway.
+            d = np.frombuffer(d, doc[METADATA][DTYPE][col])
 
             if MASK in doc[METADATA] and col in doc[METADATA][MASK]:
                 mask_data = decompress(doc[METADATA][MASK][col])
-                mask = np.fromstring(mask_data, 'bool')
+                mask = np.frombuffer(mask_data, 'bool')
                 d = ma.masked_array(d, mask)
             data[col] = d
 
-        return pd.DataFrame(data, columns=cols)[cols]
+        # Copy into
+        return pd.DataFrame(data, columns=cols, copy=True)[cols]
 
 
 class FrametoArraySerializer(Serializer):
@@ -200,6 +208,7 @@ class FrametoArraySerializer(Serializer):
 
         if columns:
             if index:
+                columns = list(columns)
                 columns.extend(meta[INDEX])
             if len(columns) > len(set(columns)):
                 raise Exception("Duplicate columns specified, cannot de-serialize")

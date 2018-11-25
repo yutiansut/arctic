@@ -1,9 +1,9 @@
 # [![arctic](logo/arctic_50.png)](https://github.com/manahl/arctic) [Arctic TimeSeries and Tick store](https://github.com/manahl/arctic)
 
 
-[![Circle CI](https://circleci.com/gh/manahl/arctic.svg?style=shield)](https://circleci.com/gh/manahl/arctic)
 [![Travis CI](https://travis-ci.org/manahl/arctic.svg?branch=master)](https://travis-ci.org/manahl/arctic)
 [![Coverage Status](https://coveralls.io/repos/github/manahl/arctic/badge.svg?branch=master)](https://coveralls.io/github/manahl/arctic?branch=master)
+[![Code Health](https://landscape.io/github/manahl/arctic/master/landscape.svg?style=flat)](https://landscape.io/github/manahl/arctic/master)
 [![Join the chat at https://gitter.im/manahl/arctic](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/manahl/arctic?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 Arctic is a high performance datastore for numeric data. It supports [Pandas](http://pandas.pydata.org/),
@@ -97,10 +97,12 @@ Arctic includes three storage engines:
       * Audited writes: API for saving metadata and data before and after a write.
       * a wide range of TimeSeries data frequencies: End-Of-Day to Minute bars
       * [See the HowTo](howtos/how_to_use_arctic.py)
+      * [Documentation](docs/versionstore.md)
   * [TickStore](arctic/tickstore/tickstore.py): Column oriented tick database.  Supports
     dynamic fields, chunks aren't versioned. Designed for large continuously ticking data.
   * [Chunkstore](https://github.com/manahl/arctic/wiki/Chunkstore): A storage type that allows data to be stored in customizable chunk sizes. Chunks
     aren't versioned, and can be appended to and updated in place. 
+    * [Documentation](docs/chunkstore.md)
 
 Arctic storage implementations are **pluggable**.  VersionStore is the default.
 
@@ -110,7 +112,7 @@ Arctic storage implementations are **pluggable**.  VersionStore is the default.
 Arctic currently works with:
 
  * Python 2.7, 3.4, 3.5, 3.6
- * pymongo >= 3.0
+ * pymongo >= 3.6
  * Pandas
  * MongoDB >= 2.4.x
 
@@ -118,6 +120,7 @@ Arctic currently works with:
 Operating Systems:
  * Linux
  * macOS
+ * Windows 10
 
 ## Acknowledgements
 
@@ -135,6 +138,7 @@ It wouldn't be possible without the work of the AHL Data Engineering Team includ
  * [Wilfred Hughes](https://github.com/wilfred)
  * [Edward Easton](https://github.com/eeaston)
  * [Bryant Moscon](https://github.com/bmoscon)
+ * [Dimosthenis Pediaditakis](https://github.com/dimosped)
  * ... and many others ...
 
 Contributions welcome!

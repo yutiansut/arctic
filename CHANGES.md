@@ -1,7 +1,89 @@
 ## Changelog
 
-### 1.57
+### 1.73 
+  * Bugfix: #658 Write/append errors for Panel objects from older pandas versions
+  * Feature: #653 Add version meta-info in arctic module
+
+### 1.72 (2018-11-06)
+  * Feature: #577 Added implementation for incremental serializer for numpy records
+  * Bugfix: #648 Fix issue with Timezone aware Pandas types, which don't contain hasobject attribute
+
+### 1.71  (2018-11-05)
+  * Bugfix: #645 Fix write errors for Pandas DataFrame that has mixed object/string types in multi-index column
+
+### 1.70 (2018-10-30)
+  * Bugfix: #157 Assure that serialized dataframes remain value-equivalent (e.g. avoid NaN --> 'nan' in mixed string columns)
+  * Bugfix: #608 Ensure Arctic performs well with MongoDB 3.6 (sorting)
+  * Bugfix: #629 Column kwarg no longer modified
+  * Bugfix: #641 DateRange.intersection open/closed range fix
+  * Feature: #493 Can pass kwargs when calling MongoClient, e.g. for ssl
+  * Feature: #590 Faster write handler selection for DataFrames with objects  
+  * Feature: #604 Improved handling handling for pickling serialization decidions
+
+
+### 1.69 (2018-09-12)
+  * Docs: VersionStore documentation
+  * Bugfix: Issue #612 ThreadPool should be created by process using it
+  * Feature: Upsert option on appends in ChunkStore
+
+### 1.68 (2018-08-17)
+  * Feature: #553 Compatibility with both the new and old LZ4 API
+  * Feature: #571 Removed the Cython LZ4 code, use the latest python-lz4
+  * Feature: #557 Threadpool based compression. Speed imrpovement and tuning benchmarks.
+  * Bugfix: fix tickstore unicode handling, support both unicode and utf-8 arrays
+  * Bugfix: #591 Fix tickstore reads not returning index with localized timezone
+  * Feature: #595 add host attribute to VersionedItem.
+  * Bugfix: #594 Enable sharding on chunkstore
+
+### 1.67.1 (2018-07-11)
+  * Bugfix: #579 Fix symbol corruption due to restore_version and append
+  * Bugfix: #584 Fix list_versions for a snapshot after deleting symbols in later versions
+
+### 1.67 (2018-05-24)
+  * Bugfix: #561 Fix PickleStore read corruption after write_metadata
+
+### 1.66 (2018-05-21)
+  * Bugfix: #168 Do not allow empty string as a column name
+  * Bugfix: #483 Remove potential floating point error from datetime_to_ms
+  * Bugfix: #271 Log when library doesnt exist on delete
+  * Feature: MetaDataStore: added list_symbols with regexp, as_of and metadata fields matching filters
+  * Feature: Support for serialization of DataFrames in Pandas 0.23.x
+
+### 1.65 (2018-04-16)
+  * Bugfix: #534 VersionStore: overwriting a symbol with different dtype (but same data format) does not
+                 raise exceptions anymore
+  * Bugfix: #531 arctic_prune_versions: clean broken snapshot references before pruning
+  * Bugfix: setup.py develop in a conda environment on Mac
+  * Feature: #490 add support to numpy 1.14
+
+### 1.63 (2018-04-06)
+  * Bugfix: #521 Clang 6.0 compiler support on macOS
+  * Feature: #510 VersionStore: support multi column in pandas DataFrames
+
+### 1.62 (2018-3-14)
+  * Bugfix: #517 VersionStore: append does not duplicate data in certain corner cases
+  * Bugfix: #519 VersionStore: list_symbols speed improvement and fix for memory limit exceed
+
+### 1.61 (2018-3-2)
+  * Feature: #288 Mapping reads and writes over chunks in chunkstore
+  * Bugfix: #508 VersionStore: list_symbols and read now always returns latest version
+  * Bugfix: #512 Improved performance for list_versions
+  * Bugfix: #515 VersionStore: _prune_previous_versions now retries the cleanup operation
+
+### 1.60 (2018-2-13)
+  * Bugfix: #503 ChunkStore: speedup check for -1 segments
+  * Feature: #504 Increasing number of libraries in Arctic to 5000.
+
+### 1.59 (2018-2-6)
+  * Bugfix: Increase performance of invalid segment check in chunkstore
+  * Bugfix: #501 Fix the spurious data integrity exceptions at write path, due to moving chunks form the balancer
+
+### 1.58 (2018-1-15)
+  * Bugfix: #491 roll back the use of frombuffer to fromstring, fixes the read-only ndarray issue
+
+### 1.57 (2018-1-11)
   * Feature: #206 String support for tickstore
+  * Bugfix: #486 improve mongo_retry robustness with failures for version store write/append
 
 ### 1.56 (2017-12-21)
   * Bugfix: #468 Re-adding compatibility for pandas 0.20.x

@@ -22,6 +22,16 @@ from tests.util import read_str_as_pandas
 register_versioned_storage(PandasDataFrameStore)
 
 
+def test_write_multi_column_to_arctic_1_40_data(multicolumn_store_with_uncompressed_write):
+    store = multicolumn_store_with_uncompressed_write['store']
+    symbol = multicolumn_store_with_uncompressed_write['symbol']
+
+    df = pd.DataFrame([[1, 2], [3, 4], [5, 6]], index=['x', 'y', 'z'], columns=[[u'a', 'w'], ['a', 'v']])
+    store.write(symbol, df)
+
+    assert np.all(store.read(symbol).data == df)
+
+
 def test_save_read_pandas_series(library):
     s = Series(data=[1, 2, 3], index=[4, 5, 6])
     library.write('pandas', s)
@@ -208,6 +218,108 @@ STRAT F22 ASD 201312'''),
     saved_df = library.read('pandas').data
     assert np.all(expected.values == saved_df.values)
     assert np.all(expected.index.names == saved_df.index.names)
+
+
+def test_append_pandas_multi_columns_dataframe(library):
+    columns = pd.MultiIndex.from_product([["bar", "baz", "foo", "qux"], ["one", "two"]], names=["first", "second"])
+    df = pd.DataFrame(np.random.randn(2, 8), index=[0, 1], columns=columns)
+    df2 = pd.DataFrame(np.random.randn(2, 8), index=[2, 3], columns=columns)
+    library.write('test', df)
+    library.append('test', df2)
+
+    saved = library.read('test')
+
+    df = df.append(df2)
+    assert df.columns.equal_levels(saved.data.columns)
+    assert np.all(saved.data.columns == df.columns)
+    assert np.all(saved.data.columns.names == df.columns.names)
+    assert np.all(saved.data.index == df.index)
+    assert np.all(saved.data.values == df.values)
+
+
+def test_append_pandas_multi_columns_dataframe_new_column(library):
+    columns = pd.MultiIndex.from_product([["bar", "baz", "foo", "qux"], ["one", "two"]], names=["first", "second"])
+    df = pd.DataFrame(np.random.randn(2, 8), index=[0, 1], columns=columns)
+    df2 = pd.DataFrame(np.random.randn(2, 8), index=[2, 3], columns=columns)
+    library.write('test', df)
+    df2['bar', 'three'] = np.random.randn(2, 1)
+    library.append('test', df2)
+
+    saved = library.read('test')
+
+    df = df.append(df2)
+    columns = list(itertools.product(["bar", "baz", "foo", "qux"], ["one", "two"]))
+    assert np.all(saved.data[columns] == df[columns])
+    assert np.all(saved.data['bar', 'three'][2:] == df['bar', 'three'][2:])
+
+
+def test_save_read_pandas_multi_columns_empty_dataframe(library):
+    columns = pd.MultiIndex.from_product([["bar", "baz", "foo", "qux"], ["one", "two"]], names=["first", "second"])
+    df = pd.DataFrame([], columns=columns)
+    library.write('test', df)
+
+    saved = library.read('test')
+
+    assert df.columns.equal_levels(saved.data.columns)
+    assert np.all(saved.data.columns == df.columns)
+    assert np.all(saved.data.columns.names == df.columns.names)
+    assert np.all(saved.data.index == df.index)
+    assert np.all(saved.data.values == df.values)
+
+
+def test_save_read_pandas_multi_columns_dataframe(library):
+    columns = pd.MultiIndex.from_product([["bar", "baz", "foo", "qux"], ["one", "two"]], names=["first", "second"])
+    df = pd.DataFrame(np.random.randn(2, 8), columns=columns)
+    library.write('test', df)
+
+    saved = library.read('test')
+
+    assert df.columns.equal_levels(saved.data.columns)
+    assert np.all(saved.data.columns == df.columns)
+    assert np.all(saved.data.columns.names == df.columns.names)
+    assert np.all(saved.data.index == df.index)
+    assert np.all(saved.data.values == df.values)
+
+
+def test_save_read_pandas_multi_columns_no_names_dataframe(library):
+    columns = pd.MultiIndex.from_product([["bar", "baz", "foo", "qux"], ["one", "two"]])
+    df = pd.DataFrame(np.random.randn(2, 8), columns=columns)
+    library.write('test', df)
+
+    saved = library.read('test')
+
+    assert df.columns.equal_levels(saved.data.columns)
+    assert np.all(saved.data.columns == df.columns)
+    assert list(saved.data.columns.names) == ["level_0", "level_1"]
+    assert np.all(saved.data.index == df.index)
+    assert np.all(saved.data.values == df.values)
+
+
+def test_save_read_pandas_multi_columns_dataframe_with_int_levels(library):
+    columns = pd.MultiIndex.from_product([[1, 2, 'a'], ['c', 5]])
+    df = pd.DataFrame([[9, 2, 8, 1, 2, 3], [3, 4, 2, 9, 10, 11]], index=['x', 'y'], columns=columns)
+    library.write('test', df)
+
+    saved = library.read('test')
+
+    # Check that column names were converted to string
+    assert [list(sublevel) for sublevel in saved.data.columns.levels] == [list(map(str, sublevel)) for sublevel in df.columns.levels]
+    assert np.all(saved.data.index == df.index)
+    assert np.all(saved.data.values == df.values)
+
+
+def test_save_read_multi_index_and_multi_columns_dataframe(library):
+    columns = pd.MultiIndex.from_product([["bar", "baz", "foo", "qux"], ["one", "two"]])
+    index = pd.MultiIndex.from_product([["x", "y", "z"], ["a", "b"]])
+    df = pd.DataFrame(np.random.randn(6, 8), index=index, columns=columns)
+    library.write('test', df)
+
+    saved = library.read('test')
+
+    assert isinstance(saved.data.index, df.index.__class__)
+    assert np.all(saved.data.index == df.index)
+    assert np.all(saved.data.columns == df.columns)
+    assert np.all(saved.data == df)
 
 
 def test_append_pandas_dataframe(library):
@@ -899,3 +1011,10 @@ def test_read_write_multiindex_store_keeps_timezone(library):
     assert list(library.read('spam').data.index[0]) == row0[:-1]
     assert list(library.read('spam').data.index[1]) == row1[:-1]
 
+
+def test_mutable_df(library):
+    s = DataFrame(data=[1, 2, 3], index=[4, 5, 6])
+    s.__array__().setflags(write=True)
+    library.write('pandas', s)
+    read_s = library.read('pandas')
+    assert read_s.data.__array__().flags['WRITEABLE']

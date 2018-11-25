@@ -11,7 +11,7 @@ from itertools import groupby
 from pymongo.errors import OperationFailure
 
 from ..decorators import mongo_retry
-from .._util import indent
+from .._util import indent, mongo_count, enable_sharding
 from ..serialization.numpy_arrays import FrametoArraySerializer, DATA, METADATA, COLUMNS
 from .date_chunker import DateChunker, START, END
 from .passthrough_chunker import PassthroughChunker
@@ -43,8 +43,14 @@ CHUNKER_MAP = {DateChunker.TYPE: DateChunker(),
 
 class ChunkStore(object):
     @classmethod
-    def initialize_library(cls, arctic_lib, **kwargs):
+    def initialize_library(cls, arctic_lib, hashed=True, **kwargs):
         ChunkStore(arctic_lib)._ensure_index()
+
+        logger.info("Trying to enable sharding...")
+        try:
+            enable_sharding(arctic_lib.arctic, arctic_lib.get_name(), hashed=hashed, key=SYMBOL)
+        except OperationFailure as e:
+            logger.warning("Library created, but couldn't enable sharding: %s. This is OK if you're not 'admin'" % str(e))
 
     @mongo_retry
     def _ensure_index(self):
@@ -67,6 +73,8 @@ class ChunkStore(object):
                                        (START, pymongo.ASCENDING),
                                        (SEGMENT, pymongo.ASCENDING)],
                                       unique=True, background=True)
+        self._collection.create_index([(SEGMENT, pymongo.ASCENDING)],
+                                      unique=False, background=True)
         self._mdata.create_index([(SYMBOL, pymongo.ASCENDING),
                                   (START, pymongo.ASCENDING),
                                   (END, pymongo.ASCENDING)],
@@ -85,7 +93,7 @@ class ChunkStore(object):
         # Issue 442
         # for legacy data that was incorectly marked with segment start of -1
         for symbol in self.list_symbols():
-            if self._collection.find({SYMBOL: symbol, SEGMENT: -1}).count() > 1:
+            if mongo_count(self._collection, filter={SYMBOL: symbol, SEGMENT: -1}) > 1:
                 logger.warning("Symbol %s has malformed segments. Data must be rewritten or fixed with chunkstore segment_id_repair tool" % symbol)
 
     @mongo_retry
@@ -151,7 +159,7 @@ class ChunkStore(object):
                 # update symbol metadata (rows and chunk count)
                 sym = self._get_symbol_info(symbol)
                 sym[LEN] -= row_adjust
-                sym[CHUNK_COUNT] = self._collection.count({SYMBOL: symbol})
+                sym[CHUNK_COUNT] = mongo_count(self._collection, filter={SYMBOL: symbol})
                 self._symbols.replace_one({SYMBOL: symbol}, sym)
 
         else:
@@ -249,7 +257,7 @@ class ChunkStore(object):
 
         Returns
         -------
-        DataFrame or Series, or in the case when multiple symbols are given, 
+        DataFrame or Series, or in the case when multiple symbols are given,
         returns a dict of symbols (symbol -> dataframe/series)
         """
         if not isinstance(symbol, list):
@@ -259,7 +267,7 @@ class ChunkStore(object):
         if not sym:
             raise NoDataFoundException('No data found for %s' % (symbol))
 
-        
+
         spec = {SYMBOL: {'$in': symbol}}
         chunker = CHUNKER_MAP[sym[0][CHUNKER]]
         deser = SER_MAP[sym[0][SERIALIZER]].deserialize
@@ -286,7 +294,7 @@ class ChunkStore(object):
 
 
         skip_filter = not filter_data or chunk_range is None
-        
+
         if len(symbol) > 1:
             return {sym: deser(chunks[sym], **kwargs) if skip_filter else chunker.filter(deser(chunks[sym], **kwargs), chunk_range) for sym in symbol}
         else:
@@ -330,6 +338,9 @@ class ChunkStore(object):
             chunk_size:
                 used by chunker to break data into discrete chunks.
                 see specific chunkers for more information about this param.
+            func: function
+                function to apply to each chunk before writing. Function
+                can not modify the date column.
         """
         if not isinstance(item, (DataFrame, Series)):
             raise Exception("Can only chunk DataFrames and Series")
@@ -451,9 +462,9 @@ class ChunkStore(object):
 
             data = SER_MAP[sym[SERIALIZER]].serialize(record)
             meta = data[METADATA]
-            
+
             chunk_count = int(len(data[DATA]) / MAX_CHUNK_SIZE + 1)
-            seg_count = self._collection.count({SYMBOL: symbol, START: start, END: end})
+            seg_count = mongo_count(self._collection, filter={SYMBOL: symbol, START: start, END: end})
             # remove old segments for this chunk in case we now have less
             # segments than we did before
             if seg_count > chunk_count:
@@ -494,7 +505,7 @@ class ChunkStore(object):
                 audit['appended_rows'] = appended
             self._audit.insert_one(audit)
 
-    def append(self, symbol, item, metadata=None, audit=None):
+    def append(self, symbol, item, upsert=False, metadata=None, audit=None, **kwargs):
         """
         Appends data from item to symbol's data in the database.
 
@@ -506,14 +517,21 @@ class ChunkStore(object):
             the symbol for the given item in the DB
         item: DataFrame or Series
             the data to append
+        upsert:
+            write data if symbol does not exist
         metadata: ?
             optional per symbol metadata
         audit: dict
             optional audit information
+        kwargs:
+            passed to write if upsert is true and symbol does not exist
         """
         sym = self._get_symbol_info(symbol)
         if not sym:
-            raise NoDataFoundException("Symbol does not exist.")
+            if upsert:
+                return self.write(symbol, item, metadata=metadata, audit=audit, **kwargs)
+            else:
+                raise NoDataFoundException("Symbol does not exist.")
         if audit is not None:
             audit['symbol'] = symbol
             audit['action'] = 'append'

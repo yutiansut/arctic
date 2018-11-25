@@ -1,14 +1,18 @@
-import logging
 import hashlib
+import logging
+import os
+from operator import itemgetter
+
 
 from bson.binary import Binary
 import numpy as np
 import pymongo
 from pymongo.errors import OperationFailure, DuplicateKeyError
 
+from arctic._util import mongo_count
 from ..decorators import mongo_retry
 from ..exceptions import UnhandledDtypeException, DataIntegrityException
-from ._version_store_utils import checksum
+from ._version_store_utils import checksum, version_base_or_id, _fast_check_corruption
 
 from .._compression import compress_array, decompress
 from six.moves import xrange
@@ -19,6 +23,9 @@ logger = logging.getLogger(__name__)
 _CHUNK_SIZE = 2 * 1024 * 1024 - 2048  # ~2 MB (a bit less for usePowerOf2Sizes)
 _APPEND_SIZE = 1 * 1024 * 1024  # 1MB
 _APPEND_COUNT = 60  # 1 hour of 1 min data
+
+# Enabling the following has roughly a 5-7% performance hit (off by default)
+_CHECK_CORRUPTION_ON_APPEND = bool(os.environ.get('CHECK_CORRUPTION_ON_APPEND'))
 
 
 def _promote_struct_dtypes(dtype1, dtype2):
@@ -36,16 +43,93 @@ def _promote_struct_dtypes(dtype1, dtype2):
     return np.dtype([(n, _promote(dtype1.fields[n][0], dtype2.fields.get(n, (None,))[0])) for n in dtype1.names])
 
 
+def _attempt_update_unchanged(symbol, unchanged_segment_ids, collection, version, previous_version):
+    if not unchanged_segment_ids or not collection or not version:
+        return
+
+    # Currenlty it is called only from _concat_and_rewrite, with "base_version_id" always empty
+    # Use version_base_or_id() instead, to make the method safe going forward, called form anywhere
+    parent_id = version_base_or_id(version)
+
+    # Update the parent set of the unchanged/compressed segments
+    result = collection.update_many({
+                                        'symbol': symbol,  # hit only the right shard
+                                                           # update_many is a broadcast query otherwise
+                                        '_id': {'$in': [x['_id'] for x in unchanged_segment_ids]}
+                                    },
+                                    {'$addToSet': {'parent': parent_id}})
+    # Fast check for success without extra query
+    if result.matched_count == len(unchanged_segment_ids):
+        return
+    # update_many is tricky sometimes wrt matched_count across replicas when balancer runs. Check based on _id.
+    unchanged_ids = set([x['_id'] for x in unchanged_segment_ids])
+    spec = {'symbol': symbol,
+            'parent': parent_id,
+            'segment': {'$lte': unchanged_segment_ids[-1]['segment']}}
+    matched_segments_ids = set([x['_id'] for x in collection.find(spec)])
+    if unchanged_ids != matched_segments_ids:
+        logger.error("Mismatched unchanged segments for {}: {} != {} (query spec={})".format(
+                        symbol, unchanged_ids, matched_segments_ids, spec))
+        raise DataIntegrityException("Symbol: {}:{} update_many updated {} segments instead of {}".format(
+            symbol, previous_version['version'], result.matched_count, len(unchanged_segment_ids)))
+
+
+def _resize_with_dtype(arr, dtype):
+    """
+    This function will transform arr into an array with the same type as dtype. It will do this by
+    filling new columns with zeros (or NaNs, if it is a float column). Also, columns that are not
+    in the new dtype will be dropped.
+    """
+    structured_arrays = dtype.names is not None and arr.dtype.names is not None
+    old_columns = arr.dtype.names or []
+    new_columns = dtype.names or []
+
+    # In numpy 1.9 the ndarray.astype method used to handle changes in number of fields. The code below
+    # should replicate the same behaviour the old astype used to have.
+    #
+    # One may be tempted to use np.lib.recfunctions.stack_arrays to implement both this step and the
+    # concatenate that follows but it 2x slower and it requires providing your own default values (instead
+    # of np.zeros).
+    #
+    # Numpy 1.14 supports doing new_arr[old_columns] = arr[old_columns], which is faster than the code below
+    # (in benchmarks it seems to be even slightly faster than using the old astype). However, that is not
+    # supported by numpy 1.9.2.
+    if structured_arrays and (old_columns != new_columns):
+        old_columns = set(old_columns)
+        new_columns = set(new_columns)
+
+        new_arr = np.zeros(arr.shape, dtype)
+        for c in old_columns & new_columns:
+            new_arr[c] = arr[c]
+
+        # missing float columns should default to nan rather than zero
+        _is_float_type = lambda _dtype: _dtype.type in (np.float32, np.float64)
+        _is_void_float_type = lambda _dtype: _dtype.type == np.void and _is_float_type(_dtype.subdtype[0])
+        _is_float_or_void_float_type = lambda _dtype: _is_float_type(_dtype) or _is_void_float_type(_dtype)
+        _is_float = lambda column: _is_float_or_void_float_type(dtype.fields[column][0])
+        for new_column in filter(_is_float, new_columns - old_columns):
+            new_arr[new_column] = np.nan
+
+        return new_arr.astype(dtype)
+    else:
+        return arr.astype(dtype)
+
+
+def set_corruption_check_on_append(enable):
+    global _CHECK_CORRUPTION_ON_APPEND
+    _CHECK_CORRUPTION_ON_APPEND = bool(enable)
+
+
 class NdarrayStore(object):
     """Chunked store for arbitrary ndarrays, supporting append.
-    
+
     for the simple example:
     dat = np.empty(10)
     library.write('test', dat) #version 1
     library.append('test', dat) #version 2
-    
+
     version documents:
-    
+
     [
      {u'_id': ObjectId('55fa9a7781f12654382e58b8'),
       u'symbol': u'test',
@@ -60,7 +144,7 @@ class NdarrayStore(object):
       u'sha': Binary('.........', 0),
       u'shape': [-1],
       },
-      
+
      {u'_id': ObjectId('55fa9aa981f12654382e58ba'),
       u'symbol': u'test',
       u'version': 2
@@ -74,7 +158,7 @@ class NdarrayStore(object):
       u'segment_count': 2, #2 segments included in this version
       }
       ]
-    
+
 
     segment documents:
     
@@ -126,8 +210,12 @@ class NdarrayStore(object):
     def can_read(self, version, symbol):
         return version['type'] == self.TYPE
 
+    @staticmethod
+    def can_write_type(data):
+        return isinstance(data, np.ndarray)
+
     def can_write(self, version, symbol, data):
-        return isinstance(data, np.ndarray) and not data.dtype.hasobject
+        return self.can_write_type(data) and not data.dtype.hasobject
 
     def _dtype(self, string, metadata=None):
         if metadata is None:
@@ -157,6 +245,10 @@ class NdarrayStore(object):
         ret['rows'] = int(version['up_to'])
         return ret
 
+    @staticmethod
+    def read_options():
+        return ['from_version']
+
     def read(self, arctic_lib, version, symbol, read_preference=None, **kwargs):
         index_range = self._index_range(version, symbol, **kwargs)
         collection = arctic_lib.get_top_level_collection()
@@ -167,7 +259,7 @@ class NdarrayStore(object):
     def _do_read(self, collection, version, symbol, index_range=None):
         '''
         index_range is a 2-tuple of integers - a [from, to) range of segments to be read. 
-            Either from or to can be None, indicating no bound. 
+            Either from or to can be None, indicating no bound.
         '''
         from_index = index_range[0] if index_range else None
         to_index = version['up_to']
@@ -176,7 +268,7 @@ class NdarrayStore(object):
         segment_count = None
 
         spec = {'symbol': symbol,
-                'parent': version.get('base_version_id', version['_id']),
+                'parent': version_base_or_id(version),
                 'segment': {'$lt': to_index}
                 }
         if from_index is not None:
@@ -184,15 +276,10 @@ class NdarrayStore(object):
         else:
             segment_count = version.get('segment_count', None)
 
-        segments = []
+        data = bytearray()
         i = -1
-        for i, x in enumerate(collection.find(spec, sort=[('segment', pymongo.ASCENDING)],)):
-            segments.append(decompress(x['data']) if x['compressed'] else x['data'])
-
-        data = b''.join(segments)
-
-        # free up memory from initial copy of data
-        del segments
+        for i, x in enumerate(sorted(collection.find(spec), key=itemgetter('segment'))):
+            data.extend(decompress(x['data']) if x['compressed'] else x['data'])
 
         # Check that the correct number of segments has been returned
         if segment_count is not None and i + 1 != segment_count:
@@ -200,7 +287,7 @@ class NdarrayStore(object):
                                    symbol, version['version'], segment_count, i + 1, collection.database.name + '.' + collection.name))
 
         dtype = self._dtype(version['dtype'], version.get('dtype_metadata', {}))
-        rtn = np.fromstring(data, dtype=dtype).reshape(version.get('shape', (-1)))
+        rtn = np.frombuffer(data, dtype=dtype).reshape(version.get('shape', (-1)))
         return rtn
 
     def _promote_types(self, dtype, dtype_str):
@@ -221,6 +308,9 @@ class NdarrayStore(object):
 
         if not dtype:
             dtype = item.dtype
+
+        if (self._dtype(previous_version['dtype']).fields is None) != (dtype.fields is None):
+            raise ValueError("type changes to or from structured array not supported")
         
         if previous_version['up_to'] == 0:
             dtype = dtype
@@ -237,17 +327,10 @@ class NdarrayStore(object):
             version['dtype_metadata'] = dict(dtype.metadata or {})
             version['type'] = self.TYPE
 
-            old_arr = self._do_read(collection, previous_version, symbol).astype(dtype)
-            # missing float columns should default to nan rather than zero
-            old_dtype = self._dtype(previous_version['dtype'])
-            if dtype.names is not None and old_dtype.names is not None:
-                new_columns = set(dtype.names) - set(old_dtype.names)
-                _is_float_type = lambda _dtype: _dtype.type in (np.float32, np.float64)
-                _is_void_float_type = lambda _dtype: _dtype.type == np.void and _is_float_type(_dtype.subdtype[0])
-                _is_float_or_void_float_type = lambda _dtype: _is_float_type(_dtype) or _is_void_float_type(_dtype)
-                _is_float = lambda column: _is_float_or_void_float_type(dtype.fields[column][0])
-                for new_column in filter(_is_float, new_columns):
-                    old_arr[new_column] = np.nan
+            # This function will drop columns read from the previous version if they are not found in the
+            # new append. However, the promote_types will raise an exception in that case and this code
+            # will not be reached.
+            old_arr = _resize_with_dtype(self._do_read(collection, previous_version, symbol), dtype)
 
             item = np.concatenate([old_arr, item])
             version['up_to'] = len(item)
@@ -258,6 +341,15 @@ class NdarrayStore(object):
             version['dtype'] = previous_version['dtype']
             version['dtype_metadata'] = previous_version['dtype_metadata']
             version['type'] = self.TYPE
+            
+            # Verify (potential) corruption with append
+            if _CHECK_CORRUPTION_ON_APPEND and _fast_check_corruption(
+                    collection, symbol, previous_version,
+                    check_count=False, check_last_segment=True, check_append_safe=True):
+                logging.warning("Found mismatched segments for {} (version={}). "
+                                "Converting append to concat and rewrite".format(symbol, previous_version['version']))
+                dirty_append = True  # force a concat and re-write (use new base version id)
+
             self._do_append(collection, version, symbol, item, previous_version, dirty_append)
 
     def _do_append(self, collection, version, symbol, item, previous_version, dirty_append):
@@ -278,7 +370,7 @@ class NdarrayStore(object):
         #_CHUNK_SIZE is probably too big if we're only appending single rows of data - perhaps something smaller,
         #or also look at number of appended segments?
         if not dirty_append and version['append_count'] < _APPEND_COUNT and version['append_size'] < _APPEND_SIZE:
-            version['base_version_id'] = previous_version.get('base_version_id', previous_version['_id'])
+            version['base_version_id'] = version_base_or_id(previous_version)
 
             if len(item) > 0:
 
@@ -320,20 +412,17 @@ class NdarrayStore(object):
 
         # Figure out which is the last 'full' chunk
         spec = {'symbol': symbol,
-                'parent': previous_version.get('base_version_id', previous_version['_id']),
+                'parent': version_base_or_id(previous_version),
                 'segment': {'$lt': previous_version['up_to']}}
 
         read_index_range = [0, None]
-        # The unchanged segments are those not yet compressed
+        # The unchanged segments are the compressed ones (apart from the last compressed)
         unchanged_segment_ids = []
-        for segment in collection.find(spec, projection={'_id':1,
-                                                         'segment':1,
-                                                         'compressed': 1
-                                                         },
-                                       sort=[('segment', pymongo.ASCENDING)]):
+        for segment in sorted(collection.find(spec, projection={'_id': 1, 'segment': 1, 'compressed': 1}),
+                              key=itemgetter('segment')):
             # We want to stop iterating when we find the first uncompressed chunks
             if not segment['compressed']:
-                # We include the last chunk in the recompression
+                # We include the last compressed chunk in the recompression
                 if unchanged_segment_ids:
                     unchanged_segment_ids.pop()
                 break
@@ -363,29 +452,25 @@ class NdarrayStore(object):
             self._do_write(collection, version, symbol, np.concatenate([old_arr, item]), previous_version,
                            segment_offset=read_index_range[0])
         if unchanged_segment_ids:
-            result = collection.update_many({'_id': {'$in': [x['_id'] for x in unchanged_segment_ids]}},
-                                            {'$addToSet': {'parent': version['_id']}})
-            if result.matched_count != len(unchanged_segment_ids):
-                raise DataIntegrityException("Symbol: %s:%s update_many updated %s segments instead of %s" %
-                                                (symbol, previous_version['version'],
-                                                 result.matched_count,
-                                                 len(unchanged_segment_ids)
-                                                 ))
+            _attempt_update_unchanged(symbol, unchanged_segment_ids, collection, version, previous_version)
             version['segment_count'] = version['segment_count'] + len(unchanged_segment_ids)
             self.check_written(collection, symbol, version)
 
     def check_written(self, collection, symbol, version):
+        # Currently only called from methods which guarantee 'base_version_id' is not populated.
+        # Make it nonetheless safe for the general case.
+        parent_id = version_base_or_id(version)
+
         # Check all the chunks are in place
-        seen_chunks = collection.find({'symbol': symbol, 'parent': version['_id']},
-                                      ).count()
+        seen_chunks = mongo_count(collection, filter={'symbol': symbol, 'parent': parent_id})
 
         if seen_chunks != version['segment_count']:
-            segments = [x['segment'] for x in collection.find({'symbol': symbol, 'parent': version['_id']},
+            segments = [x['segment'] for x in collection.find({'symbol': symbol, 'parent': parent_id},
                                                               projection={'segment': 1},
                                                               )]
             raise pymongo.errors.OperationFailure("Failed to write all the Chunks. Saw %s expecting %s"
                                                   "Parent: %s \n segments: %s" %
-                                                  (seen_chunks, version['segment_count'], version['_id'], segments))
+                                                  (seen_chunks, version['segment_count'], parent_id, segments))
 
     def checksum(self, item):
         sha = hashlib.sha1()
@@ -405,9 +490,10 @@ class NdarrayStore(object):
         version['type'] = self.TYPE
         version['up_to'] = len(item)
         version['sha'] = self.checksum(item)
-        
+
         if previous_version:
             if 'sha' in previous_version \
+                    and previous_version['dtype'] == version['dtype'] \
                     and self.checksum(item[:previous_version['up_to']]) == previous_version['sha']:
                 # The first n rows are identical to the previous version, so just append.
                 # Do a 'dirty' append (i.e. concat & start from a new base version) for safety
@@ -488,7 +574,7 @@ class NdarrayStore(object):
         segments: list of offsets. Each offset is the row index of the
                   the last row of a particular chunk relative to the start of the _original_ item.
                   array(new_data) - segments = array(offsets in item)
-        
+
         Returns:
         --------
         Library specific index metadata to be stored in the version document.

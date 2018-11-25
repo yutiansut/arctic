@@ -2,12 +2,13 @@ import bson
 import logging
 from bson.binary import Binary
 from bson.errors import InvalidDocument
+from operator import itemgetter
 from six.moves import cPickle, xrange
 import io
 from .._compression import decompress, compress_array
 import pymongo
 
-from ._version_store_utils import checksum, pickle_compat_load
+from ._version_store_utils import checksum, pickle_compat_load, version_base_or_id
 from ..exceptions import UnsupportedPickleStoreVersion
 
 
@@ -37,14 +38,14 @@ class PickleStore(object):
         if blob is not None:
             if blob == _MAGIC_CHUNKEDV2:
                 collection = mongoose_lib.get_top_level_collection()
-                data = b''.join(decompress(x['data']) for x in collection.find({'symbol': symbol,
-                                                                                'parent': version['_id']},
-                                                                               sort=[('segment', pymongo.ASCENDING)]))
+                data = b''.join(decompress(x['data']) for x in sorted(
+                    collection.find({'symbol': symbol, 'parent': version_base_or_id(version)}),
+                    key=itemgetter('segment')))
             elif blob == _MAGIC_CHUNKED:
                 collection = mongoose_lib.get_top_level_collection()
-                data = b''.join(x['data'] for x in collection.find({'symbol': symbol,
-                                                                    'parent': version['_id']},
-                                                                   sort=[('segment', pymongo.ASCENDING)]))
+                data = b''.join(x['data'] for x in sorted(
+                    collection.find({'symbol': symbol, 'parent': version_base_or_id(version)}),
+                    key=itemgetter('segment')))
                 data = decompress(data)
             else:
                 if blob[:len(_MAGIC_CHUNKED)] == _MAGIC_CHUNKED:
@@ -56,6 +57,10 @@ class PickleStore(object):
                     logger.error("Failed to read symbol %s" % symbol)
             return pickle_compat_load(io.BytesIO(data))
         return version['data']
+
+    @staticmethod
+    def read_options():
+        return []
 
     def write(self, arctic_lib, version, symbol, item, previous_version):
         try:

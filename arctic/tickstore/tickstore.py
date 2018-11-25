@@ -12,11 +12,22 @@ from pymongo import ReadPreference
 from pymongo.errors import OperationFailure
 from six import iteritems, string_types
 
+try:
+    from pandas.api.types import infer_dtype
+except ImportError:
+    from pandas.lib import infer_dtype
+
 from ..date import DateRange, to_pandas_closed_closed, mktz, datetime_to_ms, ms_to_datetime, CLOSED_CLOSED, to_dt, utc_dt_to_local_dt
 from ..decorators import mongo_retry
 from ..exceptions import OverlappingDataException, NoDataFoundException, UnorderedDataException, UnhandledDtypeException, ArcticException
 from .._util import indent
-from arctic._compression import compress, compressHC, decompress
+
+try:
+    from lz4.block import compress as lz4_compress, decompress as lz4_decompress
+    lz4_compressHC = lambda _str: lz4_compress(_str, mode='high_compression')
+except ImportError as e:
+    from lz4 import compress as lz4_compress, compressHC as lz4_compressHC, decompress as lz4_decompress
+
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +350,7 @@ class TickStore(object):
         mgr = _arrays_to_mgr(arrays, columns, index, columns, dtype=None)
         rtn = pd.DataFrame(mgr)
         # Present data in the user's default TimeZone
-        rtn.index.tz = mktz()
+        rtn.index = rtn.index.tz_convert(mktz())
 
         t = (dt.now() - perf_start).total_seconds()
         ticks = len(rtn)
@@ -435,7 +446,8 @@ class TickStore(object):
         rtn = {}
         if doc[VERSION] != 3:
             raise ArcticException("Unhandled document version: %s" % doc[VERSION])
-        rtn[INDEX] = np.cumsum(np.fromstring(decompress(doc[INDEX]), dtype='uint64'))
+        # np.cumsum copies the read-only array created with frombuffer
+        rtn[INDEX] = np.cumsum(np.frombuffer(lz4_decompress(doc[INDEX]), dtype='uint64'))
         doc_length = len(rtn[INDEX])
         column_set.update(doc[COLUMNS].keys())
 
@@ -444,7 +456,8 @@ class TickStore(object):
         for c in column_set:
             try:
                 coldata = doc[COLUMNS][c]
-                mask = np.fromstring(decompress(coldata[ROWMASK]), dtype='uint8')
+                # the or below will make a copy of this read-only array
+                mask = np.frombuffer(lz4_decompress(coldata[ROWMASK]), dtype='uint8')
                 union_mask = union_mask | mask
             except KeyError:
                 rtn[c] = None
@@ -460,10 +473,13 @@ class TickStore(object):
             try:
                 coldata = doc[COLUMNS][c]
                 dtype = np.dtype(coldata[DTYPE])
-                values = np.fromstring(decompress(coldata[DATA]), dtype=dtype)
+                # values ends up being copied by pandas before being returned to the user. However, we
+                # copy it into a bytearray here for safety.
+                values = np.frombuffer(bytearray(lz4_decompress(coldata[DATA])), dtype=dtype)
                 self._set_or_promote_dtype(column_dtypes, c, dtype)
                 rtn[c] = self._empty(rtn_length, dtype=column_dtypes[c])
-                rowmask = np.unpackbits(np.fromstring(decompress(coldata[ROWMASK]),
+                # unpackbits will make a copy of the read-only array created by frombuffer
+                rowmask = np.unpackbits(np.frombuffer(lz4_decompress(coldata[ROWMASK]),
                                         dtype='uint8'))[:doc_length].astype('bool')
                 rowmask = rowmask[union_mask]
                 rtn[c][rowmask] = values
@@ -634,14 +650,17 @@ class TickStore(object):
             array = array.astype('<i8')
         elif (array.dtype.kind) == 'f':
             array = array.astype('<f8')
-        elif (array.dtype.kind) in ('U', 'S'):
-            array = array.astype(np.unicode_)
-        elif (array.dtype.kind) == 'O':
-            try:
-                array = np.array([s.encode('utf-8') for s in array])
-                array = array.astype(np.unicode_)
-            except:
+        elif (array.dtype.kind) in ('O', 'U', 'S'):
+            if (array.dtype.kind) == 'O' and infer_dtype(array) not in ['unicode', 'string', 'bytes']:
+                # `string` in python2 and `bytes` in python3
                 raise UnhandledDtypeException("Casting object column to string failed")
+            try:
+                array = array.astype(np.unicode_)
+            except (UnicodeDecodeError, SystemError):
+                # `UnicodeDecodeError` in python2 and `SystemError` in python3
+                array = np.array([s.decode('utf-8') for s in array])
+            except:
+                raise UnhandledDtypeException("Only unicode and utf8 strings are supported.")
         else:
             raise UnhandledDtypeException("Unsupported dtype '%s' - only int64, float64 and U are supported" % array.dtype)
         # Everything is little endian in tickstore
@@ -679,18 +698,18 @@ class TickStore(object):
         rtn[START] = start
 
         logger.warning("NB treating all values as 'exists' - no longer sparse")
-        rowmask = Binary(compressHC(np.packbits(np.ones(len(df), dtype='uint8')).tostring()))
+        rowmask = Binary(lz4_compressHC(np.packbits(np.ones(len(df), dtype='uint8')).tostring()))
 
         index_name = df.index.names[0] or "index"
         recs = df.to_records(convert_datetime64=False)
         for col in df:
             array = TickStore._ensure_supported_dtypes(recs[col])
             col_data = {}
-            col_data[DATA] = Binary(compressHC(array.tostring()))
+            col_data[DATA] = Binary(lz4_compressHC(array.tostring()))
             col_data[ROWMASK] = rowmask
             col_data[DTYPE] = TickStore._str_dtype(array.dtype)
             rtn[COLUMNS][col] = col_data
-        rtn[INDEX] = Binary(compressHC(np.concatenate(([recs[index_name][0].astype('datetime64[ms]').view('uint64')],
+        rtn[INDEX] = Binary(lz4_compressHC(np.concatenate(([recs[index_name][0].astype('datetime64[ms]').view('uint64')],
                                                            np.diff(recs[index_name].astype('datetime64[ms]').view('uint64')))).tostring()))
         return rtn, final_image
 
@@ -721,13 +740,13 @@ class TickStore(object):
                         rowmask[k][i] = 1
                     data[k] = [v]
 
-        rowmask = dict([(k, Binary(compressHC(np.packbits(v).tostring())))
+        rowmask = dict([(k, Binary(lz4_compressHC(np.packbits(v).tostring())))
                         for k, v in iteritems(rowmask)])
         for k, v in iteritems(data):
             if k != 'index':
                 v = np.array(v)
                 v = TickStore._ensure_supported_dtypes(v)
-                rtn[COLUMNS][k] = {DATA: Binary(compressHC(v.tostring())),
+                rtn[COLUMNS][k] = {DATA: Binary(lz4_compressHC(v.tostring())),
                                    DTYPE: TickStore._str_dtype(v.dtype),
                                    ROWMASK: rowmask[k]}
 
@@ -739,8 +758,8 @@ class TickStore(object):
             start = min(start, image_start)
             rtn[IMAGE_DOC] = {IMAGE_TIME: image_start, IMAGE: initial_image}
         rtn[END] = end
-        rtn[START] =  start
-        rtn[INDEX] = Binary(compressHC(np.concatenate(([data['index'][0]], np.diff(data['index']))).tostring()))
+        rtn[START] = start
+        rtn[INDEX] = Binary(lz4_compressHC(np.concatenate(([data['index'][0]], np.diff(data['index']))).tostring()))
         return rtn, final_image
 
     def max_date(self, symbol):
@@ -754,4 +773,21 @@ class TickStore(object):
         """
         res = self._collection.find_one({SYMBOL: symbol}, projection={ID: 0, END: 1},
                                         sort=[(START, pymongo.DESCENDING)])
+        if res is None:
+            raise NoDataFoundException("No Data found for {}".format(symbol))
         return utc_dt_to_local_dt(res[END])
+
+    def min_date(self, symbol):
+        """
+        Return the minimum datetime stored for a particular symbol
+
+        Parameters
+        ----------
+        symbol : `str`
+            symbol name for the item
+        """
+        res = self._collection.find_one({SYMBOL: symbol}, projection={ID: 0, START: 1},
+                                        sort=[(START, pymongo.ASCENDING)])
+        if res is None:
+            raise NoDataFoundException("No Data found for {}".format(symbol))
+        return utc_dt_to_local_dt(res[START])

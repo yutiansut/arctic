@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from datetime import datetime as dt
 from mock import patch, call, Mock
 import numpy as np
@@ -8,7 +9,9 @@ from pandas import DatetimeIndex
 from pymongo import ReadPreference
 import pytest
 import pytz
+import six
 
+from arctic._util import mongo_count
 from arctic.date import DateRange, mktz, CLOSED_CLOSED, CLOSED_OPEN, OPEN_CLOSED, OPEN_OPEN
 from arctic.exceptions import NoDataFoundException
 
@@ -43,6 +46,36 @@ def test_read(tickstore_lib):
     assert_array_equal(df['PRICE'].values, np.array([1545, 1543.75]))
     assert_array_equal(df.index.values.astype('object'), np.array([1185076787070000000, 1185141600600000000]))
     assert tickstore_lib._collection.find_one()['c'] == 2
+    assert df.index.tzinfo == mktz()
+
+
+def test_read_data_is_modifiable(tickstore_lib):
+    data = [{'ASK': 1545.25,
+                  'ASKSIZE': 1002.0,
+                  'BID': 1545.0,
+                  'BIDSIZE': 55.0,
+                  'CUMVOL': 2187387.0,
+                  'DELETED_TIME': 0,
+                  'INSTRTYPE': 'FUT',
+                  'PRICE': 1545.0,
+                  'SIZE': 1.0,
+                  'TICK_STATUS': 0,
+                  'TRADEHIGH': 1561.75,
+                  'TRADELOW': 1537.25,
+                  'index': 1185076787070},
+                 {'CUMVOL': 354.0,
+                  'DELETED_TIME': 0,
+                  'PRICE': 1543.75,
+                  'SIZE': 354.0,
+                  'TRADEHIGH': 1543.75,
+                  'TRADELOW': 1543.75,
+                  'index': 1185141600600}]
+    tickstore_lib.write('FEED::SYMBOL', data)
+
+    df = tickstore_lib.read('FEED::SYMBOL', columns=['BID', 'ASK', 'PRICE'])
+
+    df[['BID', 'ASK', 'PRICE']] = 7
+    assert np.all(df[['BID', 'ASK', 'PRICE']].values == np.array([[7, 7, 7], [7, 7, 7]]))
 
 
 def test_read_allow_secondary(tickstore_lib):
@@ -153,6 +186,8 @@ def test_read_all_cols_all_dtypes(tickstore_lib, chunk_size):
     tickstore_lib.write('sym', data)
     df = tickstore_lib.read('sym', columns=None)
 
+    assert df.index.tzinfo == mktz()
+
     # The below is probably more trouble than it's worth, but we *should*
     # be able to roundtrip data and get the same answer...
 
@@ -164,7 +199,7 @@ def test_read_all_cols_all_dtypes(tickstore_lib, chunk_size):
     index = DatetimeIndex([dt(1970, 1, 1, tzinfo=mktz('UTC')),
                          dt(1970, 1, 1, 0, 0, 1, tzinfo=mktz('UTC'))],
                         )
-    index.tz = mktz()
+    df.index = df.index.tz_convert(mktz('UTC'))
     expected = pd.DataFrame(data, index=index)
     expected = expected[df.columns]
     assert_frame_equal(expected, df, check_names=False)
@@ -210,31 +245,31 @@ def test_date_range(tickstore_lib):
     with patch('pymongo.collection.Collection.find', side_effect=tickstore_lib._collection.find) as f:
         df = tickstore_lib.read('SYM', date_range=DateRange(20130101, 20130103), columns=None)
         assert_array_equal(df['b'].values, np.array([2., 3., 5.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 1
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 1
         df = tickstore_lib.read('SYM', date_range=DateRange(20130102, 20130103), columns=None)
         assert_array_equal(df['b'].values, np.array([3., 5.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 1
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 1
         df = tickstore_lib.read('SYM', date_range=DateRange(20130103, 20130103), columns=None)
         assert_array_equal(df['b'].values, np.array([5.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 1
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 1
 
         df = tickstore_lib.read('SYM', date_range=DateRange(20130102, 20130104), columns=None)
         assert_array_equal(df['b'].values, np.array([3., 5., 7.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 2
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 2
         df = tickstore_lib.read('SYM', date_range=DateRange(20130102, 20130105), columns=None)
         assert_array_equal(df['b'].values, np.array([3., 5., 7., 9.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 2
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 2
 
         df = tickstore_lib.read('SYM', date_range=DateRange(20130103, 20130104), columns=None)
         assert_array_equal(df['b'].values, np.array([5., 7.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 2
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 2
         df = tickstore_lib.read('SYM', date_range=DateRange(20130103, 20130105), columns=None)
         assert_array_equal(df['b'].values, np.array([5., 7., 9.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 2
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 2
 
         df = tickstore_lib.read('SYM', date_range=DateRange(20130104, 20130105), columns=None)
         assert_array_equal(df['b'].values, np.array([7., 9.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 1
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 1
 
         # Test the different open-closed behaviours
         df = tickstore_lib.read('SYM', date_range=DateRange(20130104, 20130105, CLOSED_CLOSED), columns=None)
@@ -264,7 +299,7 @@ def test_date_range_end_not_in_range(tickstore_lib):
     with patch.object(tickstore_lib._collection, 'find', side_effect=tickstore_lib._collection.find) as f:
         df = tickstore_lib.read('SYM', date_range=DateRange(20130101, dt(2013, 1, 2, 9, 0)), columns=None)
         assert_array_equal(df['b'].values, np.array([2.]))
-        assert tickstore_lib._collection.find(f.call_args_list[-1][0][0]).count() == 1
+        assert mongo_count(tickstore_lib._collection, filter=f.call_args_list[-1][0][0]) == 1
 
 
 @pytest.mark.parametrize('tz_name', ['UTC',
@@ -291,15 +326,18 @@ def test_date_range_default_timezone(tickstore_lib, tz_name):
         tickstore_lib._chunk_size = 1
         tickstore_lib.write('SYM', DUMMY_DATA)
         df = tickstore_lib.read('SYM', date_range=DateRange(20130101, 20130701), columns=None)
+
+        assert df.index.tzinfo == mktz()
+
         assert len(df) == 2
         assert df.index[1] == dt(2013, 7, 1, tzinfo=mktz(tz_name))
-        assert df.index.tz == mktz(tz_name)
-
         df = tickstore_lib.read('SYM', date_range=DateRange(20130101, 20130101), columns=None)
         assert len(df) == 1
+        assert df.index.tzinfo == mktz()
 
         df = tickstore_lib.read('SYM', date_range=DateRange(20130701, 20130701), columns=None)
         assert len(df) == 1
+        assert df.index.tzinfo == mktz()
 
 
 def test_date_range_no_bounds(tickstore_lib):
@@ -616,6 +654,33 @@ def test_read_with_metadata(tickstore_lib):
 
 def test_read_strings(tickstore_lib):
     df = pd.DataFrame(data={'data': ['A', 'B', 'C']},
+                      index=pd.Index(data=[dt(2016, 1, 1, 00, tzinfo=mktz('UTC')),
+                                           dt(2016, 1, 2, 00, tzinfo=mktz('UTC')),
+                                           dt(2016, 1, 3, 00, tzinfo=mktz('UTC'))], name='date'))
+    tickstore_lib.write('test', df)
+    read_df = tickstore_lib.read('test')
+    assert(all(read_df['data'].values == df['data'].values))
+
+
+def test_read_utf8_strings(tickstore_lib):
+    data = ['一', '二', '三'] # Chinese character [one, two , three]
+    if six.PY2:
+      utf8_data = data
+      unicode_data = [s.decode('utf8') for s in data]
+    else:
+      utf8_data = [s.encode('utf8') for s in data]
+      unicode_data = data
+    df = pd.DataFrame(data={'data': utf8_data},
+                      index=pd.Index(data=[dt(2016, 1, 1, 00, tzinfo=mktz('UTC')),
+                                           dt(2016, 1, 2, 00, tzinfo=mktz('UTC')),
+                                           dt(2016, 1, 3, 00, tzinfo=mktz('UTC'))], name='date'))
+    tickstore_lib.write('test', df)
+    read_df = tickstore_lib.read('test')
+    assert(all(read_df['data'].values == np.array(unicode_data)))
+
+
+def test_read_unicode_strings(tickstore_lib):
+    df = pd.DataFrame(data={'data': [u'一', u'二', u'三']}, # Chinese character [one, two , three]
                       index=pd.Index(data=[dt(2016, 1, 1, 00, tzinfo=mktz('UTC')),
                                            dt(2016, 1, 2, 00, tzinfo=mktz('UTC')),
                                            dt(2016, 1, 3, 00, tzinfo=mktz('UTC'))], name='date'))

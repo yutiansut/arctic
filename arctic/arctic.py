@@ -1,10 +1,10 @@
 import logging
 import os
+import re
+import threading
 
 import pymongo
 from pymongo.errors import OperationFailure, AutoReconnect
-import threading
-
 from ._util import indent
 from .auth import authenticate, get_auth
 from .decorators import mongo_retry
@@ -70,9 +70,12 @@ class Arctic(object):
 
     def __init__(self, mongo_host, app_name=APPLICATION_NAME, allow_secondary=False,
                  socketTimeoutMS=10 * 60 * 1000, connectTimeoutMS=2 * 1000,
-                 serverSelectionTimeoutMS=30 * 1000):
+                 serverSelectionTimeoutMS=30 * 1000, **kwargs):
         """
         Constructs a Arctic Datastore.
+
+        Note: If mongo_host is a pymongo connection and the process is later forked, the
+                new pymongo connection may have different parameters.
 
         Parameters:
         -----------
@@ -92,6 +95,8 @@ class Arctic(object):
             the pymongo driver will spend on MongoDB cluster discovery.  This parameter
             takes precedence over connectTimeoutMS: https://jira.mongodb.org/browse/DRIVERS-222
 
+        kwargs: 'dict' extra keyword arguments to pass when calling pymongo.MongoClient,
+            for example ssl parameters.
         """
         self._application_name = app_name
         self._library_cache = {}
@@ -101,16 +106,19 @@ class Arctic(object):
         self._server_selection_timeout = serverSelectionTimeoutMS
         self._lock = threading.RLock()
         self._pid = os.getpid()
+        self._pymongo_kwargs = kwargs
 
         if isinstance(mongo_host, string_types):
+            self._given_instance = False
             self.mongo_host = mongo_host
         else:
+            self._given_instance = True
             self.__conn = mongo_host
             # Workaround for: https://jira.mongodb.org/browse/PYTHON-927
             mongo_host.server_info()
             self.mongo_host = ",".join(["{}:{}".format(x[0], x[1]) for x in mongo_host.nodes])
             self._adminDB = self._conn.admin
-    
+
     @property
     @mongo_retry
     def _conn(self):
@@ -119,6 +127,9 @@ class Arctic(object):
             #    http://api.mongodb.com/python/current/faq.html#using-pymongo-with-multiprocessing
             curr_pid = os.getpid()
             if curr_pid != self._pid:
+                if self._given_instance:
+                    logger.warn("Forking process. Arctic was passed a pymongo connection during init, "
+                                "the new pymongo connection may have different parameters.")
                 self._pid = curr_pid  # this line has to precede reset() otherwise we get to eternal recursion
                 self.reset()  # also triggers re-auth
 
@@ -126,10 +137,11 @@ class Arctic(object):
                 host = get_mongodb_uri(self.mongo_host)
                 logger.info("Connecting to mongo: {0} ({1})".format(self.mongo_host, host))
                 self.__conn = pymongo.MongoClient(host=host,
-                                                   maxPoolSize=self._MAX_CONNS,
-                                                   socketTimeoutMS=self._socket_timeout,
-                                                   connectTimeoutMS=self._connect_timeout,
-                                                   serverSelectionTimeoutMS=self._server_selection_timeout)
+                                                  maxPoolSize=self._MAX_CONNS,
+                                                  socketTimeoutMS=self._socket_timeout,
+                                                  connectTimeoutMS=self._connect_timeout,
+                                                  serverSelectionTimeoutMS=self._server_selection_timeout,
+                                                  **self._pymongo_kwargs)
                 self._adminDB = self.__conn.admin
 
                 # Authenticate against admin for the user
@@ -179,16 +191,44 @@ class Arctic(object):
         list of Arctic library names
         """
         libs = []
-        for db in self._conn.database_names():
+        for db in self._conn.list_database_names():
             if db.startswith(self.DB_PREFIX + '_'):
-                for coll in self._conn[db].collection_names():
+                for coll in self._conn[db].list_collection_names():
                     if coll.endswith(self.METADATA_COLL):
                         libs.append(db[len(self.DB_PREFIX) + 1:] + "." + coll[:-1 * len(self.METADATA_COLL) - 1])
             elif db == self.DB_PREFIX:
-                for coll in self._conn[db].collection_names():
+                for coll in self._conn[db].list_collection_names():
                     if coll.endswith(self.METADATA_COLL):
                         libs.append(coll[:-1 * len(self.METADATA_COLL) - 1])
         return libs
+
+    def library_exists(self, library):
+        """
+        Check whether a given library exists.
+
+        Parameters
+        ----------
+        library : `str`
+            The name of the library. e.g. 'library' or 'user.library'
+
+        Returns
+        -------
+        `bool`
+            True if the library with the given name already exists, False otherwise
+        """
+        exists = False
+        try:
+            # This forces auth errors, and to fall back to the slower "list_collections"
+            ArcticLibraryBinding(self, library).get_library_type()
+            # This will obtain the library, if no exception thrown we have verified its existence
+            self.get_library(library)
+            exists = True
+        except OperationFailure:
+            exists = library in self.list_libraries()
+        except LibraryNotFoundException:
+            pass
+        return exists
+
 
     @mongo_retry
     def initialize_library(self, library, lib_type=VERSION_STORE, **kwargs):
@@ -209,10 +249,12 @@ class Arctic(object):
             Arguments passed to the Library type for initialization.
         """
         l = ArcticLibraryBinding(self, library)
-        # Check that we don't create too many namespaces
-        if len(self._conn[l.database_name].collection_names()) > 3000:
+        # check that we don't create too many namespaces
+        # can be disabled check_library_count=False
+        check_library_count = kwargs.pop('check_library_count', True)
+        if len(self._conn[l.database_name].list_collection_names()) > 5000 and check_library_count:
             raise ArcticException("Too many namespaces %s, not creating: %s" %
-                                  (len(self._conn[l.database_name].collection_names()), library))
+                                  (len(self._conn[l.database_name].list_collection_names()), library))
         l.set_library_type(lib_type)
         LIBRARY_TYPES[lib_type].initialize_library(l, **kwargs)
         # Add a 10G quota just in case the user is calling this with API.
@@ -231,9 +273,11 @@ class Arctic(object):
         """
         l = ArcticLibraryBinding(self, library)
         colname = l.get_top_level_collection().name
+        if not [c for c in l._db.list_collection_names(False) if re.match(r"^{}([\.].*)?$".format(colname), c)]:
+            logger.info('Nothing to delete. Arctic library %s does not exist.' % colname)
         logger.info('Dropping collection: %s' % colname)
         l._db.drop_collection(colname)
-        for coll in l._db.collection_names():
+        for coll in l._db.list_collection_names():
             if coll.startswith(colname + '.'):
                 logger.info('Dropping collection: %s' % coll)
                 l._db.drop_collection(coll)
@@ -348,7 +392,7 @@ class Arctic(object):
 
         logger.info('Renaming collection: %s' % colname)
         l._db[colname].rename(to_colname)
-        for coll in l._db.collection_names():
+        for coll in l._db.list_collection_names():
             if coll.startswith(colname + '.'):
                 l._db[coll].rename(coll.replace(colname, to_colname))
 
@@ -458,7 +502,7 @@ class ArcticLibraryBinding(object):
     def get_top_level_collection(self):
         """
         Return the top-level collection for the Library.  This collection is to be used
-        for storing data.  
+        for storing data.
 
         Note we expect (and callers require) this collection to have default read-preference: primary
         The read path may choose to reduce this if secondary reads are allowed.

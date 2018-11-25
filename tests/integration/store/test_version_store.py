@@ -1,20 +1,26 @@
 import bson
 import six
-from bson.son import SON
+import struct
 from datetime import datetime as dt, timedelta as dtd
 import pandas as pd
-from pandas.util.testing import assert_frame_equal
+from arctic import VERSION_STORE, PandasDataFrameStore, PandasSeriesStore
+from pandas.util.testing import assert_frame_equal, assert_series_equal
 from pymongo.errors import OperationFailure
-from pymongo.read_preferences import ReadPreference
 from pymongo.server_type import SERVER_TYPE
 from datetime import datetime
-from mock import patch
+from mock import Mock, patch
+import inspect
 import time
 import pytest
 import numpy as np
 
-from arctic.exceptions import NoDataFoundException, DuplicateSnapshotException
+import arctic
+from arctic._util import mongo_count
+from arctic.exceptions import NoDataFoundException, DuplicateSnapshotException, ArcticException
 from arctic.date import DateRange
+from arctic.store import _version_store_utils
+from arctic.store import version_store
+from tests.unit.serialization.serialization_test_data import _mixed_test_data
 
 from ...util import read_str_as_pandas
 from arctic.date._mktz import mktz
@@ -79,13 +85,13 @@ def test_store_item_new_version(library, library_name):
          patch('pymongo.server_description.ServerDescription.server_type', SERVER_TYPE.Mongos):
         library.write(symbol, ts1)
         coll = library._collection
-        count = coll.count()
-        assert coll.versions.count() == 1
+        count = mongo_count(coll)
+        assert mongo_count(coll.versions) == 1
 
         # No change to the TS
         library.write(symbol, ts1, prune_previous_version=False)
-        assert coll.count() == count
-        assert coll.versions.count() == 2
+        assert mongo_count(coll) == count
+        assert mongo_count(coll.versions) == 2
 
 
 def test_store_item_read_preference(library_secondary, library_name):
@@ -151,6 +157,28 @@ def test_read_metadata(library):
     assert after.data is None
 
 
+def test_read_metadata_newer_version_with_lower_id(library):
+    now_timestamp = int(time.time())
+    now = struct.pack(">i", now_timestamp)
+    old_id = bson.ObjectId(now + b"\x00\x00\x00\x00\x00\x00\x00\x00")
+    new_id = bson.ObjectId(now + b"\x00\x00\x00\x00\x00\x00\x00\x01")
+    object_id_class = Mock()
+    object_id_class.from_datetime = bson.ObjectId.from_datetime
+
+    object_id_class.return_value = new_id
+    with patch("bson.ObjectId", object_id_class):
+        library.write(symbol, ts1)
+
+    library.snapshot('s1')
+
+    object_id_class.return_value = old_id
+    with patch("bson.ObjectId", object_id_class):
+        library.write(symbol, ts2)
+
+    now_dt = datetime.fromtimestamp(now_timestamp)
+    assert library.read_metadata(symbol, as_of=now_dt).version == 2
+
+
 def test_read_metadata_throws_on_deleted_symbol(library):
     library.write(symbol, ts1, metadata={'key': 'value'})
     library.delete(symbol)
@@ -169,7 +197,7 @@ def test_store_item_and_update(library):
     original = datetime.now()
 
     # Assertions:
-    assert coll.versions.count() == 1
+    assert mongo_count(coll.versions) == 1
     assert_frame_equal(library.read(symbol).data, ts1)
 
     # Update the TimeSeries
@@ -177,7 +205,7 @@ def test_store_item_and_update(library):
     library.write(symbol, ts2, prune_previous_version=False)
     recent = datetime.now()
 
-    assert coll.versions.count() == 2
+    assert mongo_count(coll.versions) == 2
     assert_frame_equal(library.read(symbol).data, ts2)
 
     # Get the different versions of the DB
@@ -190,7 +218,7 @@ def test_store_item_and_update(library):
     time.sleep(1)
     library.write(symbol, ts1, prune_previous_version=False)
 
-    assert coll.versions.count() == 3
+    assert mongo_count(coll.versions) == 3
     assert_frame_equal(library.read(symbol).data, ts1)
 
     # Get the different versions of the DB
@@ -208,7 +236,7 @@ def test_append_update(library):
     coll = library._collection
 
     # Assertions:
-    assert coll.versions.count() == 1
+    assert mongo_count(coll.versions) == 1
     assert_frame_equal(library.read(symbol).data, ts1)
 
     # Append an item
@@ -222,7 +250,7 @@ def test_append_update(library):
     # Saving ts2 shouldn't create any new chunks.  Instead it should
     # reuse the last chunk.
     library.write(symbol, ts2, prune_previous_version=False)
-    assert coll.versions.count() == 2
+    assert mongo_count(coll.versions) == 2
     assert_frame_equal(library.read(symbol, as_of='snap').data, ts1)
     assert_frame_equal(library.read(symbol).data, ts2)
 
@@ -418,7 +446,7 @@ def test_delete_versions(library):
     assert_frame_equal(library.read(symbol).data, ts2)
 
     library._delete_version(symbol, 4)
-    assert coll.count() == 0
+    assert mongo_count(coll) == 0
 
 
 def test_delete_bson_versions(library):
@@ -430,24 +458,24 @@ def test_delete_bson_versions(library):
     library.write(symbol, c, prune_previous_version=False)
     library.write(symbol, a, prune_previous_version=False)
     library.write(symbol, c, prune_previous_version=False)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
 
     library._delete_version(symbol, 1)
     assert library.read(symbol, as_of=2).data == c
     assert library.read(symbol, as_of=3).data == a
-    assert coll.versions.count() == 3
+    assert mongo_count(coll.versions) == 3
 
     library._delete_version(symbol, 2)
     assert library.read(symbol, as_of=3).data == a
     assert library.read(symbol, as_of=4).data == c
-    assert coll.versions.count() == 2
+    assert mongo_count(coll.versions) == 2
 
     library._delete_version(symbol, 3)
-    assert coll.versions.count() == 1
+    assert mongo_count(coll.versions) == 1
     assert library.read(symbol).data == c
 
     library._delete_version(symbol, 4)
-    assert coll.versions.count() == 0
+    assert mongo_count(coll.versions) == 0
 
 
 def test_read_none_does_not_exception(library):
@@ -675,11 +703,11 @@ def test_prunes_multiple_versions(library):
         library.write(symbol, a, prune_previous_version=False)
     with patch("bson.ObjectId", return_value=bson.ObjectId.from_datetime(now - dtd(minutes=119))):
         library.write(symbol, c, prune_previous_version=False)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
 
     # Prunes all versions older than the most recent version that's older than 10 mins
     library.write(symbol, a, prune_previous_version=True)
-    assert coll.versions.count() == 3
+    assert mongo_count(coll.versions) == 3
     assert library.read(symbol, as_of=3).data == a
     assert library.read(symbol, as_of=4).data == c
     assert library.read(symbol, as_of=5).data == a
@@ -700,11 +728,11 @@ def test_prunes_doesnt_prune_snapshots(library):
         library.write(symbol, a, prune_previous_version=False)
     with patch("bson.ObjectId", return_value=bson.ObjectId.from_datetime(now - dtd(minutes=119))):
         library.write(symbol, c, prune_previous_version=False)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
 
     # Prunes all versions older than the most recent version that's older than 10 mins
     library.write(symbol, a, prune_previous_version=True)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
     assert library.read(symbol, as_of='snap').data == c
     assert library.read(symbol, as_of=3).data == a
     assert library.read(symbol, as_of=4).data == c
@@ -712,9 +740,9 @@ def test_prunes_doesnt_prune_snapshots(library):
 
     # Remove the snapshot, the version should now be pruned
     library.delete_snapshot('snap')
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
     library.write(symbol, c, prune_previous_version=True)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
     assert library.read(symbol, as_of=4).data == c
     assert library.read(symbol, as_of=5).data == a
     assert library.read(symbol, as_of=6).data == c
@@ -735,11 +763,11 @@ def test_prunes_multiple_versions_ts(library):
         library.write(symbol, a, prune_previous_version=False)
     with patch("bson.ObjectId", return_value=bson.ObjectId.from_datetime(now - dtd(minutes=119))):
         library.write(symbol, c, prune_previous_version=False)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
 
     # Prunes all versions older than the most recent version that's older than 10 mins
     library.write(symbol, a, prune_previous_version=True)
-    assert coll.versions.count() == 3
+    assert mongo_count(coll.versions) == 3
     assert_frame_equal(library.read(symbol, as_of=3).data, a)
     assert_frame_equal(library.read(symbol, as_of=4).data, c)
     assert_frame_equal(library.read(symbol, as_of=5).data, a)
@@ -760,11 +788,11 @@ def test_prunes_doesnt_prune_snapshots_ts(library):
         library.write(symbol, a, prune_previous_version=False)
     with patch("bson.ObjectId", return_value=bson.ObjectId.from_datetime(now - dtd(minutes=119))):
         library.write(symbol, c, prune_previous_version=False)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
 
     # Prunes all versions older than the most recent version that's older than 10 mins
     library.write(symbol, a, prune_previous_version=True)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
     assert_frame_equal(library.read(symbol, as_of='snap').data, c)
     assert_frame_equal(library.read(symbol, as_of=3).data, a)
     assert_frame_equal(library.read(symbol, as_of=4).data, c)
@@ -772,9 +800,9 @@ def test_prunes_doesnt_prune_snapshots_ts(library):
 
     # Remove the snapshot, the version should now be pruned
     library.delete_snapshot('snap')
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
     library.write(symbol, c, prune_previous_version=True)
-    assert coll.versions.count() == 4
+    assert mongo_count(coll.versions) == 4
     assert_frame_equal(library.read(symbol, as_of=4).data, c)
     assert_frame_equal(library.read(symbol, as_of=5).data, a)
     assert_frame_equal(library.read(symbol, as_of=6).data, c)
@@ -801,7 +829,7 @@ def test_prunes_multiple_versions_fully_different_tss(library):
         library.write(symbol, c, prune_previous_version=False)
     with patch("bson.ObjectId", return_value=bson.ObjectId.from_datetime(now - dtd(minutes=119))):
         library.write(symbol, c, prune_previous_version=False)
-    assert coll.versions.count() == 5
+    assert mongo_count(coll.versions) == 5
 
     # Prunes all versions older than the most recent version that's older than 10 mins
     library.write(symbol, c, prune_previous_version=True)
@@ -832,11 +860,11 @@ def test_prunes_doesnt_prune_snapshots_fully_different_tss(library):
         library.write(symbol, c, prune_previous_version=False)
     with patch("bson.ObjectId", return_value=bson.ObjectId.from_datetime(now - dtd(minutes=119))):
         library.write(symbol, c, prune_previous_version=False)
-    assert coll.versions.count() == 6
+    assert mongo_count(coll.versions) == 6
 
     # Prunes all versions older than the most recent version that's older than 10 mins
     library.write(symbol, c, prune_previous_version=True)
-    assert coll.versions.count() == 5
+    assert mongo_count(coll.versions) == 5
     assert_frame_equal(library.read(symbol, as_of='snap').data, c)
     assert_frame_equal(library.read(symbol, as_of=4).data, c)
     assert_frame_equal(library.read(symbol, as_of=5).data, c)
@@ -844,7 +872,7 @@ def test_prunes_doesnt_prune_snapshots_fully_different_tss(library):
     assert_frame_equal(library.read(symbol, as_of=7).data, c)
 
     library.delete_snapshot('snap')
-    assert coll.versions.count() == 5
+    assert mongo_count(coll.versions) == 5
     library.write(symbol, c, prune_previous_version=True)
     assert_frame_equal(library.read(symbol, as_of=4).data, c)
     assert_frame_equal(library.read(symbol, as_of=5).data, c)
@@ -948,6 +976,47 @@ def test_list_symbols_regex(library):
     assert library.list_symbols(b={'$gt': 5}, regex='asd') == ['asdf']
 
 
+def test_list_symbols_newer_version_with_lower_id(library):
+    now = struct.pack(">i", int(time.time()))
+    old_id = bson.ObjectId(now + b"\x00\x00\x00\x00\x00\x00\x00\x00")
+    new_id = bson.ObjectId(now + b"\x00\x00\x00\x00\x00\x00\x00\x01")
+    object_id_class = Mock()
+    object_id_class.from_datetime = bson.ObjectId.from_datetime
+
+    object_id_class.return_value = new_id
+    with patch("bson.ObjectId", object_id_class):
+        library.write(symbol, ts1)
+
+    library.snapshot('s1')
+
+    object_id_class.return_value = old_id
+    with patch("bson.ObjectId", object_id_class):
+        library.delete(symbol)
+
+    assert symbol not in library.list_symbols()
+
+
+def test_list_symbols_write_snapshot_write_delete(library):
+    library.write('asdf', {'foo': 'bar'})
+    symbol = 'sym_a'
+    library.write(symbol, {'foo2': 'bar2'}, prune_previous_version=False)
+    library.snapshot('s1')
+    library.write(symbol, {'foo3': 'bar2'}, prune_previous_version=False)
+    library.delete(symbol)
+    # at this point we have one version retained from 's1' and
+    # one more version added with delete (version with foo3 is pruned)
+    # The list_symbols should return only 'asdf'
+    assert library.list_symbols() == ['asdf']
+
+
+def test_list_symbols_delete_write(library):
+    symbol = 'sym_a'
+    library.write(symbol, {'foo': 'bar2'}, prune_previous_version=False)
+    library.delete(symbol)
+    library.write(symbol, {'foo2': 'bar2'}, prune_previous_version=False)
+    assert library.list_symbols() == [symbol]
+
+
 def test_date_range_large(library):
     index = [dt(2017,1,1)]*20000 + [dt(2017,1,2)]*20000
     data = np.random.random((40000, 10))
@@ -1003,11 +1072,11 @@ def test_write_metadata_followed_by_append(library):
     with patch('arctic.arctic.logger.info') as info:
         library.write(symbol, data=mydf_a, metadata={'field_a': 1})  # creates version 1
         library.write_metadata(symbol, metadata={'field_b': 1})  # creates version 2 (only metadata)
-        library.append(symbol, data=mydf_b,metadata={'field_c': 1})  # creates version 3
+        library.append(symbol, data=mydf_b, metadata={'field_c': 1})  # creates version 3
 
         # Trigger GC now
-        library._prune_previous_versions(symbol, 0)
         time.sleep(2)
+        library._prune_previous_versions(symbol, 0)
 
         v = library.read(symbol)
         assert_frame_equal(v.data, mydf_a.append(mydf_b))
@@ -1117,18 +1186,18 @@ def test_restore_version(library):
         library.write(symbol, data=mydf_a, metadata={'field_a': 1})  # creates version 1
         library.write(symbol, data=mydf_b, metadata={'field_a': 2})  # creates version 2
 
-        v = library.read(symbol)
-        assert_frame_equal(v.data, mydf_b)
-        assert v.metadata == {'field_a': 2}
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf_b)
+        assert item.metadata == {'field_a': 2}
         assert library._read_metadata(symbol).get('version') == 2
 
-        library.restore_version(symbol, as_of=1)  # creates version 3
+        restore_item = library.restore_version(symbol, as_of=1)  # creates version 3
+        assert restore_item.version == 3
+        assert restore_item.metadata == {'field_a': 1}
 
-        #library._delete_version(symbol, 1)  # delete the original version to test further the robustness/dependency
-
-        v = library.read(symbol)
-        assert_frame_equal(v.data, mydf_a)
-        assert v.metadata == {'field_a': 1}
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf_a)
+        assert item.metadata == {'field_a': 1}
         assert library._read_metadata(symbol).get('version') == 3
 
 
@@ -1140,16 +1209,20 @@ def test_restore_version_followed_by_append(library):
     with patch('arctic.arctic.logger.info') as info:
         library.write(symbol, data=mydf_a, metadata={'field_a': 1})  # creates version 1
         library.write(symbol, data=mydf_b, metadata={'field_b': 2})  # creates version 2
-        library.restore_version(symbol, as_of=1)  # creates version 3
+
+        restore_item = library.restore_version(symbol, as_of=1)  # creates version 3
+        assert restore_item.version == 3
+        assert restore_item.metadata == {'field_a': 1}
+
         library.append(symbol, data=mydf_c, metadata={'field_c': 3})  # creates version 4
 
         # Trigger GC now
         library._prune_previous_versions(symbol, 0)
         time.sleep(2)
 
-        v = library.read(symbol)
-        assert_frame_equal(v.data, mydf_a.append(mydf_c))
-        assert v.metadata == {'field_c': 3}
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf_a.append(mydf_c))
+        assert item.metadata == {'field_c': 3}
         assert library._read_metadata(symbol).get('version') == 4
 
 
@@ -1161,7 +1234,9 @@ def test_restore_version_purging_previous_versions(library):
         library.write(symbol, data=mydf_a, metadata={'field_a': 1})  # creates version 1
         library.write(symbol, data=mydf_b, metadata={'field_a': 2})  # creates version 2
 
-        library.restore_version(symbol, as_of=1)  # creates version 3
+        restore_item = library.restore_version(symbol, as_of=1)  # creates version 3
+        assert restore_item.version == 3
+        assert restore_item.metadata == {'field_a': 1}
 
         # Trigger GC now
         library._prune_previous_versions(symbol, 0)
@@ -1169,9 +1244,9 @@ def test_restore_version_purging_previous_versions(library):
 
         # library._delete_version(symbol, 1)  # delete the original version to test further the robustness/dependency
 
-        v = library.read(symbol)
-        assert_frame_equal(v.data, mydf_a)
-        assert v.metadata == {'field_a': 1}
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf_a)
+        assert item.metadata == {'field_a': 1}
         assert library._read_metadata(symbol).get('version') == 3
 
 
@@ -1184,10 +1259,10 @@ def test_restore_version_non_existent_version(library):
         with pytest.raises(NoDataFoundException):
             library.restore_version(symbol, as_of=3)
 
-        v = library.read(symbol)
-        assert_frame_equal(v.data, mydf_a)
-        assert v.metadata == {'field_a': 1}
-        assert library._read_metadata(symbol).get('version') == 1
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf_a)
+        assert item.metadata == {'field_a': 1}
+        assert item.version == 1
 
 
 def test_restore_version_which_updated_only_metadata(library):
@@ -1199,26 +1274,336 @@ def test_restore_version_which_updated_only_metadata(library):
         library.write_metadata(symbol, metadata={'field_b': 1})  # creates version 2
         library.write(symbol, data=mydf_b)  # creates version 3
 
-        library.restore_version(symbol, as_of=2)  # creates version 4
+        restore_item = library.restore_version(symbol, as_of=2)  # creates version 4
+        assert restore_item.version == 4
+        assert restore_item.metadata == {'field_b': 1}
 
-        v = library.read(symbol)
-        assert_frame_equal(v.data, mydf_a)
-        assert v.metadata == {'field_b': 1}
-        assert library._read_metadata(symbol).get('version') == 4
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf_a)
+        assert item.metadata == {'field_b': 1}
+        assert item.version == 4
 
 
-def test_restore_version_snapshot(library):
+def test_restore_version_then_snapshot(library):
     symbol = 'FTL'
     mydf_a = _rnd_df(10, 5)
     mydf_b = _rnd_df(10, 5)
     with patch('arctic.arctic.logger.info') as info:
         library.write(symbol, data=mydf_a, metadata={'field_a': 1})  # creates version 1
         library.write_metadata(symbol, metadata={'field_b': 1})  # creates version 2
-        library.restore_version(symbol, as_of=2)  # creates version 3
+
+        restore_item = library.restore_version(symbol, as_of=1)  # creates version 3
+        assert restore_item.metadata == {'field_a': 1}
+        assert restore_item.version == 3
+
         library.snapshot('SNAP_1')
         library.write(symbol, data=mydf_b)  # creates version 3
 
-        v = library.read(symbol, as_of='SNAP_1')
-        assert_frame_equal(v.data, mydf_a)
-        assert v.metadata == {'field_b': 1}
-        assert library._read_metadata(symbol, as_of='SNAP_1').get('version') == 3
+        item = library.read(symbol, as_of='SNAP_1')
+        assert_frame_equal(item.data, mydf_a)
+        assert item.metadata == {'field_a': 1}
+        assert item.version == 3
+
+
+def test_restore_version_latest_snapshot_noop(library):
+    symbol = 'FTL'
+    mydf_a = _rnd_df(10, 5)
+    with patch('arctic.arctic.logger.info') as info:
+        library.write(symbol, data=mydf_a, metadata={'field_a': 1})  # creates version 1
+        library.write_metadata(symbol, metadata={'field_b': 1})  # creates version 2
+        library.snapshot('SNAP_1')
+
+        restore_item = library.restore_version(symbol, as_of='SNAP_1')  # does not create a new version
+        assert restore_item.metadata == {'field_b': 1}
+        assert restore_item.version == 2
+
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf_a)
+        assert item.metadata == {'field_b': 1}
+        assert item.version == 2
+
+
+def test_restore_version_latest_version_noop(library):
+    symbol = 'FTL'
+    mydf_a = _rnd_df(10, 5)
+    with patch('arctic.arctic.logger.info') as info:
+        library.write(symbol, data=mydf_a, metadata={'field_a': 1})  # creates version 1
+        library.write_metadata(symbol, metadata={'field_b': 1})  # creates version 2
+
+        restore_item = library.restore_version(symbol, as_of=2)  # does not create a new version
+        assert restore_item.metadata == {'field_b': 1}
+        assert restore_item.version == 2
+
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf_a)
+        assert item.metadata == {'field_b': 1}
+        assert item.version == 2
+
+
+def test_restore_version_snap_delete_symbol_restore(library):
+    symbol = 'FTL'
+    mydf = _rnd_df(20, 5)
+    with patch('arctic.arctic.logger.info') as info:
+        library.write(symbol, data=mydf[:10], metadata={'field_a': 1})  # creates version 1
+        library.append(symbol, data=mydf[10:15])  # version 2
+        library.snapshot('snapA')
+
+        library.append(symbol, data=mydf[15:20])  # version 3
+        library.delete(symbol)  # version 4
+
+        restored_item = library.restore_version(symbol, as_of='snapA')  # version 5
+        assert restored_item.metadata == {'field_a': 1}
+        assert restored_item.version == 5
+
+        item = library.read(symbol)
+        assert_frame_equal(item.data, mydf[:15])
+        assert item.metadata == {'field_a': 1}
+        assert item.version == 5
+
+
+def test_restore_from_version_with_deleted_symbol(library):
+    symbol = 'FTL'
+    mydf_a = _rnd_df(10, 5)
+    with patch('arctic.arctic.logger.info') as info:
+        library.write(symbol, data=mydf_a, metadata={'field_a': 1})  # creates version 1
+        library.delete(symbol)
+
+        with pytest.raises(NoDataFoundException):
+            library.restore_version(symbol, as_of=2)
+
+
+
+def test_prune_previous_versions_retries_on_cleanup_error(library):
+    original_cleanup = _version_store_utils.cleanup
+    def _cleanup(*args, **kwargs):
+        if _cleanup.first_try:
+            _cleanup.first_try = False
+            raise OperationFailure(0)
+        else:
+            return original_cleanup(*args, **kwargs)
+    _cleanup.first_try = True
+
+    library.write(symbol, ts1)
+    library.write(symbol, ts2)
+
+    with patch("arctic.store.version_store.cleanup", side_effect=_cleanup) as cleanup:
+        cleanup.__name__ = "cleanup"  # required by functools.wraps
+        library._prune_previous_versions(symbol, keep_mins=0)
+
+    assert len(list(library._arctic_lib.get_top_level_collection().find({'symbol': symbol}))) == 1
+
+
+def test_prune_previous_versions_retries_find_calls(library):
+    original_next = pymongo.cursor.Cursor.next
+
+    callers = set()
+    def _next(*args, **kwargs):
+        vs_caller_name = next(c for c in inspect.stack() if c[1].endswith('arctic/store/version_store.py'))[3]
+        if vs_caller_name not in callers:
+            callers.add(vs_caller_name)
+            raise OperationFailure(0)
+        else:
+            return original_next(*args, **kwargs)
+
+    library.write(symbol, ts1, prune_previous_version=False)
+    library.write(symbol, ts2, prune_previous_version=False)
+
+    with patch.object(pymongo.cursor.Cursor, "next", autospec=True, side_effect=_next):
+        library._prune_previous_versions(symbol, keep_mins=0)
+
+    assert mongo_count(library._versions, filter={'symbol': symbol}) == 1
+
+
+def test_append_does_not_duplicate_data_when_prune_fails(library):
+    side_effect = [OperationFailure(0), arctic.store.version_store.VersionStore._prune_previous_versions]
+    new_data = read_str_as_pandas("""times | near
+    2013-01-01 17:06:11.040 |  7.0
+    2013-01-02 17:06:11.040 |  8.2
+    2013-01-03 17:06:11.040 |  3.5
+    2013-01-04 17:06:11.040 |  0.7""")
+    library.write(symbol, ts1)
+
+    with patch.object(arctic.store.version_store.VersionStore, "_prune_previous_versions", autospec=True, side_effect=side_effect):
+        library.append(symbol, new_data)
+
+    data = library.read(symbol).data
+    assert len(set(data.index)) == len(data.index)
+
+
+def test_append_does_not_duplicate_data_when_publish_fails(library):
+    side_effect = [OperationFailure(0), arctic.store.version_store.VersionStore._publish_change]
+    new_data = read_str_as_pandas("""times | near
+    2013-01-01 17:06:11.040 |  7.0
+    2013-01-02 17:06:11.040 |  8.2
+    2013-01-03 17:06:11.040 |  3.5
+    2013-01-04 17:06:11.040 |  0.7""")
+    library.write(symbol, ts1)
+
+    with patch.object(arctic.store.version_store.VersionStore, "_publish_change", autospec=True, side_effect=side_effect):
+        library.append(symbol, new_data)
+
+    data = library.read(symbol).data
+    assert len(set(data.index)) == len(data.index)
+
+
+def test_write_does_not_succeed_with_a_prune_error(library):
+    # More than max retries OperationFailure would be more realistic, but ValueError is used for simplicity
+    side_effect = [ValueError, arctic.store.version_store.VersionStore._prune_previous_versions]
+    library.write(symbol, ts1)
+
+    with patch.object(arctic.store.version_store.VersionStore, "_prune_previous_versions", autospec=True, side_effect=side_effect):
+        with pytest.raises(ValueError):
+            library.write(symbol, ts1)
+
+    assert len(library.list_versions(symbol)) == 1
+
+
+def test_write_does_not_succeed_with_a_publish_error(library):
+    # More than max retries OperationFailure would be more realistic, but ValueError is used for simplicity
+    side_effect = [ValueError, arctic.store.version_store.VersionStore._publish_change]
+
+    with patch.object(arctic.store.version_store.VersionStore, "_publish_change", autospec=True, side_effect=side_effect):
+        with pytest.raises(ValueError):
+            library.append(symbol, ts1)
+
+    assert not library.list_versions(symbol)
+
+
+def test_prune_keeps_version(library):
+    library.write(symbol, ts1)
+    library.write(symbol, ts1)
+    old_version = [v["_id"] for v in library._versions.find({"symbol": symbol}, sort=[("_id", 1)])][0]
+
+    library._prune_previous_versions(symbol, keep_mins=0, keep_version=old_version)
+
+    assert len(library.list_versions(symbol)) == 2
+
+
+def test_empty_string_column_name(library):
+    df = pd.DataFrame(data=[0, 1, 2], index=[0, 1, 2])
+    df.columns = ['']
+
+    with pytest.raises(ArcticException):
+        library.write('df', df)
+
+
+def test_snapshot_list_versions_after_delete(library, library_name):
+    library.write("symA", 'data data')
+    library.write("symB", 'data data')
+    library.write("symC", 'data data')
+    library.snapshot('snapA')
+
+    library.delete('symC')
+
+    assert {v['symbol'] for v in library.list_versions(snapshot='snapA')} == {'symA', 'symB', 'symC'}
+
+
+def test_write_non_serializable_throws(arctic):
+    lib_name = 'write_hanlder_test'
+    arctic.initialize_library(lib_name, VERSION_STORE)
+    with patch('arctic.store.version_store.STRICT_WRITE_HANDLER_MATCH', True):
+        library = arctic[lib_name]
+
+        # Check that falling back to a pickle from a dataframe throws
+        df = pd.DataFrame({'a': [dict(a=1)]})
+
+        with pytest.raises(ArcticException):
+            library.write('ns1', df)
+
+        # Check that saving a regular dataframe succeeds with this option set
+        library.write('ns2', ts1)
+        assert_frame_equal(ts1, library.read('ns2').data)
+
+
+def test_write_non_serializable_pickling_default(arctic):
+    lib_name = 'write_hanlder_test'
+    arctic.initialize_library(lib_name, VERSION_STORE)
+    library = arctic[lib_name]
+    df = pd.DataFrame({'a': [dict(a=1)]})
+    library.write('ns3', df)
+    assert_frame_equal(df, library.read('ns3').data)
+
+
+def test_write_strict_no_daterange(arctic):
+    lib_name = 'write_hanlder_test'
+    arctic.initialize_library(lib_name, VERSION_STORE)
+
+    # Write with pickling
+    with patch('arctic.store.version_store.STRICT_WRITE_HANDLER_MATCH', True):
+        library = arctic[lib_name]
+        data = [dict(a=1)]
+        library.write('ns4', data)
+
+        # When the option is set, we should now be unable to read this item when we specify a
+        # date range, even though it was written successfully
+        with pytest.raises(ArcticException):
+            library.read('ns4', date_range=DateRange(dt(2017, 1, 1), dt(2017, 1, 2)))
+
+        assert data == library.read('ns4').data
+
+
+def test_handler_check_default_false(arctic):
+    lib_name = 'write_hanlder_test1'
+    arctic.initialize_library(lib_name, VERSION_STORE)
+    assert arctic[lib_name]._with_strict_handler_match is False
+
+
+def test_handler_check_default_osenviron(arctic):
+    with patch('arctic.store.version_store.STRICT_WRITE_HANDLER_MATCH', True):
+        lib_name = 'write_hanlder_test2'
+        arctic.initialize_library(lib_name, VERSION_STORE)
+        assert arctic[lib_name]._with_strict_handler_match is True
+
+
+def test_handler_check_set_false(arctic):
+    lib_name = 'write_hanlder_test3'
+    arctic.initialize_library(lib_name, VERSION_STORE, STRICT_WRITE_HANDLER_MATCH=False)
+    assert arctic[lib_name]._with_strict_handler_match is False
+
+
+def test_handler_check_set_true(arctic):
+    lib_name = 'write_hanlder_test4'
+    arctic.initialize_library(lib_name, VERSION_STORE, STRICT_WRITE_HANDLER_MATCH=True)
+    assert arctic[lib_name]._with_strict_handler_match is True
+
+
+def test_write_df_with_objects_in_index(library):
+    df = _mixed_test_data()['multiindex_with_object'][0]
+    library.write(symbol='symX', data=df)
+    read_data = library.read(symbol='symX').data
+    assert_frame_equal(df, read_data)
+
+
+def test_write_series_with_objects_in_index(library):
+    myseries = _mixed_test_data()['multiindex_with_object'][0]['POSITION']
+    library.write(symbol='symX', data=myseries)
+    read_data = library.read(symbol='symX').data
+    assert_series_equal(myseries, read_data)
+
+
+@pytest.mark.parametrize('input_series', [_mixed_test_data()['with_some_objects'][0]['n1'],
+                                          _mixed_test_data()['multi_column_with_some_objects'][0]['bar']['two']])
+def test_write_series_with_some_objects(library, input_series):
+    library.write(symbol='symX', data=input_series)
+    read_data = library.read(symbol='symX').data
+    assert_series_equal(input_series, read_data)
+
+
+def test_can_write_tz_aware_data_df(library):
+    mydf = _mixed_test_data()['index_tz_aware'][0]
+    library.write(symbol='symTz', data=mydf)
+    read_data = library.read(symbol='symTz').data
+    # Arctic converts by default the data to UTC, convert back
+    read_data.colB = read_data.colB.dt.tz_localize('UTC').dt.tz_convert(read_data.index.tzinfo)
+    assert library._versions.find_one({'symbol': 'symTz'})['type'] == PandasDataFrameStore.TYPE
+    assert_frame_equal(mydf, read_data)
+
+
+def test_can_write_tz_aware_data_series(library):
+    myseries = _mixed_test_data()['index_tz_aware'][0]['colB']
+    library.write(symbol='symTzSer', data=myseries)
+    read_data = library.read(symbol='symTzSer').data
+    # Arctic converts by default the data to UTC, convert back
+    read_data = read_data.dt.tz_localize('UTC').dt.tz_convert(read_data.index.tzinfo)
+    assert library._versions.find_one({'symbol': 'symTzSer'})['type'] == PandasSeriesStore.TYPE
+    assert_series_equal(myseries, read_data)

@@ -1,16 +1,17 @@
 from datetime import datetime as dt, timedelta
 import logging
+import os
 
 import bson
 from pymongo import ReadPreference
 import pymongo
-from pymongo.errors import OperationFailure, AutoReconnect
+from pymongo.errors import OperationFailure, AutoReconnect, DuplicateKeyError
 
-from .._util import indent, enable_sharding
+from .._util import indent, enable_sharding, mongo_count
 from ..date import mktz, datetime_to_ms, ms_to_datetime
 from ..decorators import mongo_retry
 from ..exceptions import NoDataFoundException, DuplicateSnapshotException, \
-    OptimisticLockException, ArcticException
+    ArcticException
 from ..hooks import log_exception
 from ._pickle_store import PickleStore
 from ._version_store_utils import cleanup
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 VERSION_STORE_TYPE = 'VersionStore'
 _TYPE_HANDLERS = []
+STRICT_WRITE_HANDLER_MATCH = bool(os.environ.get('STRICT_WRITE_HANDLER_MATCH'))
 
 
 def register_versioned_storage(storageClass):
@@ -41,9 +43,13 @@ class VersionStore(object):
     def initialize_library(cls, arctic_lib, hashed=True, **kwargs):
         c = arctic_lib.get_top_level_collection()
 
-        if '%s.changes' % c.name not in mongo_retry(c.database.collection_names)():
+        if '%s.changes' % c.name not in mongo_retry(c.database.list_collection_names)():
             # 32MB buffer for change notifications
             mongo_retry(c.database.create_collection)('%s.changes' % c.name, capped=True, size=32 * 1024 * 1024)
+
+        if 'STRICT_WRITE_HANDLER_MATCH' in kwargs:
+            arctic_lib.set_library_metadata('STRICT_WRITE_HANDLER_MATCH',
+                                            bool(kwargs.pop('STRICT_WRITE_HANDLER_MATCH')))
 
         for th in _TYPE_HANDLERS:
             th.initialize_library(arctic_lib, **kwargs)
@@ -55,6 +61,11 @@ class VersionStore(object):
             enable_sharding(arctic_lib.arctic, arctic_lib.get_name(), hashed=hashed)
         except OperationFailure as e:
             logger.warning("Library created, but couldn't enable sharding: %s. This is OK if you're not 'admin'" % str(e))
+
+    @mongo_retry
+    def _last_version_seqnum(self, symbol):
+        last_seq = self._version_nums.find_one({'symbol': symbol})
+        return last_seq['version'] if last_seq else 0
 
     @mongo_retry
     def _ensure_index(self):
@@ -74,6 +85,14 @@ class VersionStore(object):
         # Do we allow reading from secondaries
         self._allow_secondary = self._arctic_lib.arctic._allow_secondary
         self._reset()
+        self._with_strict_handler = None
+
+    @property
+    def _with_strict_handler_match(self):
+        if self._with_strict_handler is None:
+            strict_meta = self._arctic_lib.get_library_metadata('STRICT_WRITE_HANDLER_MATCH')
+            self._with_strict_handler = STRICT_WRITE_HANDLER_MATCH if strict_meta is None else strict_meta
+        return self._with_strict_handler
 
     @mongo_retry
     def _reset(self):
@@ -83,7 +102,7 @@ class VersionStore(object):
         self._snapshots = self._collection.snapshots
         self._versions = self._collection.versions
         self._version_nums = self._collection.version_nums
-        self._publish_changes = '%s.changes' % self._collection.name in self._collection.database.collection_names()
+        self._publish_changes = '%s.changes' % self._collection.name in self._collection.database.list_collection_names()
         if self._publish_changes:
             self._changes = self._collection.changes
 
@@ -133,6 +152,9 @@ class VersionStore(object):
             query['symbol'] = {'$regex': regex}
         if kwargs:
             for k, v in six.iteritems(kwargs):
+                # TODO: this doesn't work as expected as it ignores the versions with metadata.deleted set
+                #       as a result it will return symbols with matching metadata which have been deleted
+                #       Maybe better add a match step in the pipeline instead of making it part of the query
                 query['metadata.' + k] = v
         if snapshot is not None:
             try:
@@ -148,22 +170,32 @@ class VersionStore(object):
             # Match based on user criteria first
             pipeline.append({'$match': query})
         pipeline.extend([
-                        # Id is by insert time which matches version order
-                        {'$sort': {'_id':-1}},
-                        # Group by 'symbol'
-                        {'$group': {'_id': '$symbol',
-                                    'deleted': {'$first': '$metadata.deleted'},
-                                    },
-                         },
-                        # Don't include symbols which are part of some snapshot, but really deleted...
-                        {'$match': {'deleted': {'$ne': True}}},
-                        {'$project': {'_id': 0,
-                                      'symbol':  '$_id',
-                                      }
-                         }])
+            # version_custom value is: 2*version + (0 if deleted else 1)
+            # This is used to optimize aggregation query:
+            #  - avoid sorting
+            #  - be able to rely on the latest version (max) for the deleted status
+            #
+            # Be aware of that if you don't use custom sort or if use a sort before $group which utilizes
+            # exactly an existing index, the $group will do best effort to utilize this index:
+            #  - https://jira.mongodb.org/browse/SERVER-4507
+            {'$group': {
+                '_id': '$symbol',
+                'version_custom': {
+                    '$max': {
+                        '$add': [
+                            {'$multiply': ['$version', 2]},
+                            {'$cond': [{'$eq': ['$metadata.deleted', True]}, 1, 0]}
+                        ]
+                    }
+                },
+            }},
+            # Don't include symbols which are part of some snapshot, but really deleted...
+            {'$match': {'version_custom': {'$mod': [2, 0]}}}
+        ])
 
-        results = self._versions.aggregate(pipeline)
-        return sorted([x['symbol'] for x in results])
+        # We may hit the group memory limit (100MB), so use allowDiskUse to circumvent this
+        #  - https://docs.mongodb.com/manual/reference/operator/aggregation/group/#group-memory-limit
+        return sorted([x['_id'] for x in self._versions.aggregate(pipeline, allowDiskUse=True)])
 
     @mongo_retry
     def has_symbol(self, symbol, as_of=None):
@@ -234,7 +266,7 @@ class VersionStore(object):
         List of dictionaries describing the discovered versions in the library
         """
         if symbol is None:
-            symbols = self.list_symbols()
+            symbols = self.list_symbols(snapshot=snapshot)
         else:
             symbols = [symbol]
 
@@ -247,6 +279,7 @@ class VersionStore(object):
                 raise NoDataFoundException('No snapshot %s in library %s' % (snapshot, self._arctic_lib.get_name()))
 
         versions = []
+        snapshots = {ss.get('_id'): ss.get('name') for ss in self._snapshots.find()}
         for symbol in symbols:
             query['symbol'] = symbol
             seen_symbols = set()
@@ -259,7 +292,7 @@ class VersionStore(object):
                                  'deleted': meta.get('deleted', False) if meta else False,
                                  # We return offset-aware datetimes in Local Time.
                                  'date': ms_to_datetime(datetime_to_ms(version['_id'].generation_time)),
-                                 'snapshots': self._find_snapshots(version.get('parent', []))})
+                                 'snapshots': [snapshots[s] for s in version.get('parent', []) if s in snapshots]})
         return versions
 
     def _find_snapshots(self, parent_ids):
@@ -282,12 +315,21 @@ class VersionStore(object):
             handler = self._bson_handler
         return handler
 
+    @staticmethod
+    def handler_can_write_type(handler, data):
+        type_method = getattr(handler, "can_write_type", None)
+        if callable(type_method):
+            return type_method(data)
+        return False
+
     def _write_handler(self, version, symbol, data, **kwargs):
         handler = None
         for h in _TYPE_HANDLERS:
             if h.can_write(version, symbol, data, **kwargs):
                 handler = h
                 break
+            if self._with_strict_handler_match and self.handler_can_write_type(h, data):
+                raise ArcticException("Not falling back to default handler for %s" % symbol)
         if handler is None:
             version['type'] = 'default'
             handler = self._bson_handler
@@ -365,13 +407,31 @@ class VersionStore(object):
             return handler.get_info(version)
         return {}
 
+    @staticmethod
+    def handler_supports_read_option(handler, option):
+        options_method = getattr(handler, "read_options", None)
+        if callable(options_method):
+            return option in options_method()
+
+        # If the handler doesn't support interrogation of its read options assume
+        # that it does support this option (i.e. fail-open)
+        return True
+
     def _do_read(self, symbol, version, from_version=None, **kwargs):
         if version.get('deleted'):
             raise NoDataFoundException("No data found for %s in library %s" % (symbol, self._arctic_lib.get_name()))
         handler = self._read_handler(version, symbol)
+        # We don't push the date_range check in the handler's code, since the "_with_strict_handler_match"
+        #    value is configured on a per-library basis, and is part of the VersionStore instance.
+        if self._with_strict_handler_match and \
+                kwargs.get('date_range') and \
+                not self.handler_supports_read_option(handler, 'date_range'):
+            raise ArcticException("Date range arguments not supported by handler in %s" % symbol)
+
         data = handler.read(self._arctic_lib, version, symbol, from_version=from_version, **kwargs)
         return VersionedItem(symbol=symbol, library=self._arctic_lib.get_name(), version=version['version'],
-                             metadata=version.pop('metadata', None), data=data)
+                             metadata=version.pop('metadata', None), data=data,
+                             host=self._arctic_lib.arctic.mongo_host)
     _do_read_retry = mongo_retry(_do_read)
 
     @mongo_retry
@@ -397,7 +457,8 @@ class VersionStore(object):
         """
         _version = self._read_metadata(symbol, as_of=as_of, read_preference=self._read_preference(allow_secondary))
         return VersionedItem(symbol=symbol, library=self._arctic_lib.get_name(), version=_version['version'],
-                             metadata=_version.pop('metadata', None), data=None)
+                             metadata=_version.pop('metadata', None), data=None,
+                             host=self._arctic_lib.arctic.mongo_host)
 
     def _read_metadata(self, symbol, as_of=None, read_preference=None):
         if read_preference is None:
@@ -422,7 +483,7 @@ class VersionStore(object):
                 as_of = as_of.replace(tzinfo=mktz())
             _version = versions_coll.find_one({'symbol': symbol,
                                                '_id': {'$lt': bson.ObjectId.from_datetime(as_of + timedelta(seconds=1))}},
-                                              sort=[('_id', pymongo.DESCENDING)])
+                                              sort=[('symbol', pymongo.DESCENDING), ('version', pymongo.DESCENDING)])
         else:
             # Backward compatibility - as of is a version number
             _version = versions_coll.find_one({'symbol': symbol, 'version': as_of})
@@ -436,6 +497,17 @@ class VersionStore(object):
             raise NoDataFoundException("No data found for %s in library %s" % (symbol, self._arctic_lib.get_name()))
 
         return _version
+
+    def _insert_version(self, version):
+        try:
+            # Keep here the mongo_retry to avoid incrementing versions and polluting the DB with garbage segments,
+            # upon intermittent Mongo errors
+            # If, however, we get a DuplicateKeyError, suppress it and raise OperationFailure, so that the method-scoped
+            # mongo_retry re-tries and creates a new version, to overcome the issue.
+            mongo_retry(self._versions.insert_one)(version)
+        except DuplicateKeyError as err:
+            logger.exception(err)
+            raise OperationFailure("A version with the same _id exists, force a clean retry")
 
     @mongo_retry
     def append(self, symbol, data, metadata=None, prune_previous_version=True, upsert=True, **kwargs):
@@ -466,7 +538,8 @@ class VersionStore(object):
 
         if len(data) == 0 and previous_version is not None:
             return VersionedItem(symbol=symbol, library=self._arctic_lib.get_name(), version=previous_version['version'],
-                                 metadata=version.pop('metadata', None), data=None)
+                                 metadata=version.pop('metadata', None), data=None,
+                                 host=self._arctic_lib.arctic.mongo_host)
 
         if upsert and previous_version is None:
             return self.write(symbol=symbol, data=data, prune_previous_version=prune_previous_version, metadata=metadata)
@@ -482,6 +555,8 @@ class VersionStore(object):
         next_ver = self._version_nums.find_one_and_update({'symbol': symbol, },
                                                           {'$inc': {'version': 1}},
                                                           upsert=False, new=True)['version']
+
+        # This is a very important check, do not remove/modify as it is a guard-dog preventing potential data corruption
         if next_ver != previous_version['version'] + 1:
             dirty_append = True
             logger.debug('''version_nums is out of sync with previous version document.
@@ -500,24 +575,25 @@ class VersionStore(object):
         elif 'metadata' in previous_version:
             version['metadata'] = previous_version['metadata']
 
-        if handler and hasattr(handler, 'append'):
-            mongo_retry(handler.append)(self._arctic_lib, version, symbol, data,
-                                        previous_version, dirty_append=dirty_append, **kwargs)
+        if handler and hasattr(handler, 'append') and callable(handler.append):
+            handler.append(self._arctic_lib, version, symbol, data,
+                           previous_version, dirty_append=dirty_append, **kwargs)
         else:
             raise Exception("Append not implemented for handler %s" % handler)
-
-        version['version'] = next_ver
-
-        # Insert the new version into the version DB
-        mongo_retry(self._versions.insert_one)(version)
 
         self._publish_change(symbol, version)
 
         if prune_previous_version and previous_version:
-            self._prune_previous_versions(symbol)
+            # Does not allow prune to remove the base of the new version
+            self._prune_previous_versions(symbol, keep_version=version.get('base_version_id'))
+
+        # Insert the new version into the version DB
+        version['version'] = next_ver
+        self._insert_version(version)
 
         return VersionedItem(symbol=symbol, library=self._arctic_lib.get_name(), version=version['version'],
-                             metadata=version.pop('metadata', None), data=None)
+                             metadata=version.pop('metadata', None), data=None,
+                             host=self._arctic_lib.arctic.mongo_host)
 
     def _publish_change(self, symbol, version):
         if self._publish_changes:
@@ -560,22 +636,26 @@ class VersionStore(object):
                                                    sort=[('version', pymongo.DESCENDING)])
 
         handler = self._write_handler(version, symbol, data, **kwargs)
-        mongo_retry(handler.write)(self._arctic_lib, version, symbol, data, previous_version, **kwargs)
-
-        # Insert the new version into the version DB
-        mongo_retry(self._versions.insert_one)(version)
+        handler.write(self._arctic_lib, version, symbol, data, previous_version, **kwargs)
 
         if prune_previous_version and previous_version:
             self._prune_previous_versions(symbol)
 
-        logger.debug('Finished writing versions for %s', symbol)
-
         self._publish_change(symbol, version)
 
+        # Insert the new version into the version DB
+        self._insert_version(version)
+
+        logger.debug('Finished writing versions for %s', symbol)
+
         return VersionedItem(symbol=symbol, library=self._arctic_lib.get_name(), version=version['version'],
-                             metadata=version.pop('metadata', None), data=None)
+                             metadata=version.pop('metadata', None), data=None,
+                             host=self._arctic_lib.arctic.mongo_host)
 
     def _add_new_version_using_reference(self, symbol, new_version, reference_version, prune_previous_version):
+        # Attention: better not use this method following an append.
+        # It is dangerous because if it deletes the version at the last_look, the segments added by the
+        # append are dangling (if prune_previous_version is False) and can cause potentially corruption.
         constraints = new_version and \
                             reference_version and \
                             new_version['symbol'] == reference_version['symbol'] and \
@@ -586,10 +666,15 @@ class VersionStore(object):
         # to delete the reference_version, which may happen to be the last parent entry in the data segments.
         # In this case the segments will be deleted by the other process,
         # and the new version's "base_version_id" won't be referenced by any segments.
-
+        # Do a naive check for concurrent mods
+        lastv_seqn = self._last_version_seqnum(symbol)
+        if lastv_seqn != new_version['version']:
+            raise OperationFailure("The symbol {} has been modified concurrently ({} != {})".format(
+                symbol, lastv_seqn, new_version['version']))
+        
         # Insert the new version into the version DB
         # (must come before the pruning, otherwise base version won't be preserved)
-        mongo_retry(self._versions.insert_one)(new_version)
+        self._insert_version(new_version)
 
         # Check if in the meanwhile the reference version (based on which we updated incrementally) has been removed
         last_look = self._versions.find_one({'_id': reference_version['_id']})
@@ -597,9 +682,9 @@ class VersionStore(object):
             # Revert the change
             mongo_retry(self._versions.delete_one)({'_id': new_version['_id']})
             # Indicate the failure
-            raise pymongo.errors.OperationFailure("Failed to write metadata for symbol %s. "
-                                                  "The previous version (%s, %d) has been removed during the update" %
-                                                  (symbol, str(reference_version['_id']), reference_version['version']))
+            raise OperationFailure("Failed to write metadata for symbol %s. "
+                                   "The previous version (%s, %d) has been removed during the update" %
+                                   (symbol, str(reference_version['_id']), reference_version['version']))
 
 
         if prune_previous_version and reference_version:
@@ -610,8 +695,10 @@ class VersionStore(object):
         self._publish_change(symbol, new_version)
 
         return VersionedItem(symbol=symbol, library=self._arctic_lib.get_name(), version=new_version['version'],
-                             metadata=new_version.get('metadata'), data=None)
+                             metadata=new_version.get('metadata'), data=None,
+                             host=self._arctic_lib.arctic.mongo_host)
 
+    @mongo_retry
     def write_metadata(self, symbol, metadata, prune_previous_version=True, **kwargs):
         """
         Write 'metadata' under the specified 'symbol' name to this library.
@@ -659,6 +746,7 @@ class VersionStore(object):
 
         return self._add_new_version_using_reference(symbol, version, previous_version, prune_previous_version)
 
+    @mongo_retry
     def restore_version(self, symbol, as_of, prune_previous_version=True):
         """
         Restore the specified 'symbol' data and metadata to the state of a given version/snapshot/date.
@@ -683,74 +771,99 @@ class VersionStore(object):
         `VersionedItem`
             VersionedItem named tuple containing the metadata of the written symbol's version document in the store.
         """
-        # if version/snapshot/data supplied in "as_of" does not exist, will fail fast with NoDataFoundException
-        version_to_restore = mongo_retry(self._read_metadata)(symbol, as_of=as_of)
+        # TODO: This operation is tricky as it may create history branches and lead to corrupted symbols.
+        #       To avoid this we do concat_rewrite (see Issue #579)
+        #       Investigate how this can be optimized and maintain safety (i.e. avoid read/write with serialization
+        #       and compression costs, but instead:
+        #       clone segments (server-side?) / crate new (base) version / update segments' parent).
 
-        # Reaching here means that data and/or metadata exist and we are all set to update the metadata
-        new_version_num = self._version_nums.find_one_and_update({'symbol': symbol},
-                                                             {'$inc': {'version': 1}},
-                                                             upsert=True, new=True)['version']
+        version_to_restore = self._read_metadata(symbol, as_of=as_of)
 
-        # Create a new version entry, cloning the one supplied from the user
-        version = {k: version_to_restore[k] for k in version_to_restore.keys() if k != 'parent'}  # don't copy snapshots
-        version['_id'] = bson.ObjectId()
-        version['version'] = new_version_num
-        version['base_version_id'] = version_to_restore.get('base_version_id', version_to_restore['_id'])
+        # At this point it is guaranteed that the as_of version exists and doesn't have the symbol marked as deleted.
+        # If we try to restore the last version, do nothing (No-Op) and return the associated VesionedItem.
+        if self._last_version_seqnum(symbol) == version_to_restore['version']:
+            return VersionedItem(symbol=symbol, library=self._arctic_lib.get_name(),
+                                 version=version_to_restore['version'],
+                                 host=self._arctic_lib.arctic.mongo_host,
+                                 metadata=version_to_restore.pop('metadata', None), data=None)
 
-        return self._add_new_version_using_reference(symbol, version, version_to_restore, prune_previous_version)
+        # Read the existing data from as_of
+        item = self.read(symbol, as_of=as_of)
 
-    def _prune_previous_versions(self, symbol, keep_mins=120):
+        # Write back, creating a new base version
+        new_item = self.write(symbol,
+                              data=item.data, metadata=item.metadata, prune_previous_version=prune_previous_version)
+        return new_item
+
+    @mongo_retry
+    def _find_prunable_version_ids(self, symbol, keep_mins):
         """
-        Prune versions, not pointed at by snapshots which are at least keep_mins old.
+        Find all non-snapshotted versions of a symbol that are older than a version that's at least keep_mins
+        minutes old.
+
+        Based on documents available on the secondary.
         """
-        # Find all non-snapshotted versions older than a version that's at least keep_mins minutes old
-        # Based on documents available on the secondary
-        versions_find = mongo_retry(self._versions.with_options(read_preference=ReadPreference.SECONDARY_PREFERRED if keep_mins > 0 else
-                                                                ReadPreference.PRIMARY)
-                                    .find)
-        versions = list(versions_find({  # Find versions of this symbol
-                                       'symbol': symbol,
-                                       # Not snapshotted
-                                       '$or': [{'parent': {'$exists': False}}, {'parent': []}],
-                                       # At least 'keep_mins' old
-                                       '_id': {'$lt': bson.ObjectId.from_datetime(
-                                                        dt.utcnow()
-                                                        # Add one second as the ObjectId str has random fuzz
-                                                        + timedelta(seconds=1)
-                                                        - timedelta(minutes=keep_mins))
-                                               }
-                                       },
-                                      # Using version number here instead of _id as there's a very unlikely case
-                                      # where the versions are created on different hosts or processes at exactly
-                                      # the same time.
-                                      sort=[('version', pymongo.DESCENDING)],
-                                      # Keep one, that's at least 10 mins old, around
-                                      # (cope with replication delay)
-                                      skip=1,
-                                      projection=['_id', 'type'],
-                                      ))
-        if not versions:
+        read_preference = ReadPreference.SECONDARY_PREFERRED if keep_mins > 0 else ReadPreference.PRIMARY
+        versions = self._versions.with_options(read_preference=read_preference)
+        query = {'symbol': symbol,
+                 # Not snapshotted
+                 '$or': [{'parent': {'$exists': False}}, {'parent': []}],
+                 # At least 'keep_mins' old
+                 '_id': {'$lt': bson.ObjectId.from_datetime(dt.utcnow()
+                                                            # Add one second as the ObjectId
+                                                            # str has random fuzz
+                                                            + timedelta(seconds=1)
+                                                            - timedelta(minutes=keep_mins)
+                                                            )
+                         }
+                 }
+        cursor = versions.find(query,
+                               # Using version number here instead of _id as there's a very unlikely case
+                               # where the versions are created on different hosts or processes at exactly
+                               # the same time.
+                               sort=[('version', pymongo.DESCENDING)],
+                               # Guarantees at least one version is kept
+                               skip=1,
+                               projection=['_id'],
+                               )
+        return [version["_id"] for version in cursor]
+
+    @mongo_retry
+    def _find_base_version_ids(self, symbol, version_ids):
+        """
+        Return all base_version_ids for a symbol that are not bases of version_ids
+        """
+        cursor = self._versions.find({'symbol': symbol,
+                                      '_id': {'$nin': version_ids},
+                                      'base_version_id': {'$exists': True},
+                                      },
+                                     projection=['base_version_id'],
+                                     )
+        return [version["base_version_id"] for version in cursor]
+
+    def _prune_previous_versions(self, symbol, keep_mins=120, keep_version=None):
+        """
+        Prune versions, not pointed at by snapshots which are at least keep_mins old. Prune will never
+        remove all versions.
+        """
+        prunable_ids = self._find_prunable_version_ids(symbol, keep_mins)
+        if keep_version is not None:
+            try:
+                prunable_ids.remove(keep_version)
+            except ValueError:
+                pass
+        if not prunable_ids:
             return
-        version_ids = [v['_id'] for v in versions]
 
-        # Find any version_ids that are the basis of other, 'current' versions - don't prune these.
-        base_versions = set([x['base_version_id'] for x in mongo_retry(self._versions.find)({
-                                            'symbol': symbol,
-                                            '_id': {'$nin': version_ids},
-                                            'base_version_id':{'$exists':True},
-                                           },
-                                           projection=['base_version_id'],
-                                           )])
-
-        version_ids = list(set(version_ids) - base_versions)
-
+        base_version_ids = self._find_base_version_ids(symbol, prunable_ids)
+        version_ids = list(set(prunable_ids) - set(base_version_ids))
         if not version_ids:
             return
 
         # Delete the version documents
         mongo_retry(self._versions.delete_many)({'_id': {'$in': version_ids}})
         # Cleanup any chunks
-        cleanup(self._arctic_lib, symbol, version_ids)
+        mongo_retry(cleanup)(self._arctic_lib, symbol, version_ids)
 
     @mongo_retry
     def _delete_version(self, symbol, version_num, do_cleanup=True):
@@ -968,7 +1081,7 @@ class VersionStore(object):
             if len(leaked_versions):
                 logger.info("%s leaked %d versions" % (symbol, len(leaked_versions)))
             for x in leaked_versions:
-                chunk_count = chunks_coll.find({'symbol': symbol, 'parent': x}).count()
+                chunk_count = mongo_count(chunks_coll, filter={'symbol': symbol, 'parent': x})
                 logger.info("%s: Missing Version %s (%s) ; %s chunks ref'd" % (symbol,
                                                                                x.generation_time,
                                                                                x,
@@ -1012,7 +1125,7 @@ class VersionStore(object):
         if len(leaked_snaps):
             logger.info("leaked %d snapshots" % (len(leaked_snaps)))
         for x in leaked_snaps:
-            ver_count = versions_coll.find({'parent': x}).count()
+            ver_count = mongo_count(versions_coll, filter={'parent': x})
             logger.info("Missing Snapshot %s (%s) ; %s versions ref'd" % (x.generation_time,
                                                                           x,
                                                                           ver_count

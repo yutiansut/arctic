@@ -58,12 +58,31 @@ def test_read_object_2():
     coll = Mock()
     arctic_lib = Mock()
     coll.find.return_value = [{'data': Binary(compressHC(cPickle.dumps(object))),
-                               'symbol': 'sentinel.symbol'}
+                               'symbol': 'sentinel.symbol',
+                               'segment': 1}
                               ]
     arctic_lib.get_top_level_collection.return_value = coll
 
     assert PickleStore.read(self, arctic_lib, version, sentinel.symbol) == object
-    assert coll.find.call_args_list == [call({'symbol': sentinel.symbol, 'parent': sentinel._id}, sort=[('segment', 1)])]
+    assert coll.find.call_args_list == [call({'symbol': sentinel.symbol, 'parent': sentinel._id})]
+
+
+def test_read_with_base_version_id():
+    self = create_autospec(PickleStore)
+    version = {'_id': sentinel._id,
+               'base_version_id': sentinel.base_version_id,
+               'blob': '__chunked__'}
+    coll = Mock()
+    arctic_lib = Mock()
+    coll.find.return_value = [{'data': Binary(compressHC(cPickle.dumps(object))),
+                               'symbol': 'sentinel.symbol',
+                               'segment': 1}
+                              ]
+    arctic_lib.get_top_level_collection.return_value = coll
+
+    assert PickleStore.read(self, arctic_lib, version, sentinel.symbol) == object
+    assert coll.find.call_args_list == [call({'symbol': sentinel.symbol, 'parent': sentinel.base_version_id})]
+
 
 @pytest.mark.xfail(sys.version_info >= (3,),
                    reason="lz4 data written with python2 not compatible with python3")
@@ -78,7 +97,7 @@ def test_read_backward_compatibility():
         if sys.version_info[0] >= 3:
             with pytest.raises(UnicodeDecodeError), open(fname) as fh:
                 cPickle.load(fh)
-        else:    
+        else:
             with pytest.raises(TypeError), open(fname) as fh:
                 cPickle.load(fh)
 
@@ -153,5 +172,3 @@ def test_pickle_store_future_version():
     with pytest.raises(UnsupportedPickleStoreVersion) as e:
         ps.read(arctic_lib, version, sentinel.symbol)
     assert('unsupported version of pickle store' in str(e))
-
-

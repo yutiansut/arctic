@@ -1,9 +1,6 @@
 import bson
-from datetime import datetime as dt, timedelta as dtd
-from mock import patch
 import numpy as np
 from numpy.testing import assert_equal
-from pymongo.server_type import SERVER_TYPE
 import pytest
 
 from arctic.store._ndarray_store import NdarrayStore, _APPEND_COUNT
@@ -48,6 +45,40 @@ def test_promote_types2(library):
     library.append('MYARR', ndarr[-200:].astype([('abc', 'int64')]))
     saved_arr = library.read('MYARR').data
     assert np.all(ndarr.astype([('abc', np.promote_types('float64', 'int64'))]) == saved_arr)
+
+
+def test_promote_types_smaller_sizes(library):
+    library.write('MYARR', np.ones(100, dtype='int64'))
+    library.append('MYARR', np.ones(100, dtype='int32'))
+    saved_arr = library.read('MYARR').data
+    assert np.all(np.ones(200, dtype='int64') == saved_arr)
+
+
+def test_promote_types_larger_sizes(library):
+    library.write('MYARR', np.ones(100, dtype='int32'))
+    library.append('MYARR', np.ones(100, dtype='int64'))
+    saved_arr = library.read('MYARR').data
+    assert np.all(np.ones(200, dtype='int64') == saved_arr)
+
+
+def test_promote_field_types_smaller_sizes(library):
+    arr = np.array([(3, 7)], dtype=[('a', '<i8'), ('b', '<i8')])
+    library.write('MYARR', arr)
+    arr = np.array([(9, 8)], dtype=[('a', '<i4'), ('b', '<i8')])
+    library.append('MYARR', arr)
+    saved_arr = library.read('MYARR').data
+    expected = np.array([(3, 7), (9, 8)], dtype=[('a', '<i8'), ('b', '<i8')])
+    assert np.all(saved_arr == expected)
+
+
+def test_promote_field_types_larger_sizes(library):
+    arr = np.array([(3, 7)], dtype=[('a', '<i4'), ('b', '<i8')])
+    library.write('MYARR', arr)
+    arr = np.array([(9, 8)], dtype=[('a', '<i8'), ('b', '<i8')])
+    library.append('MYARR', arr)
+    saved_arr = library.read('MYARR').data
+    expected = np.array([(3, 7), (9, 8)], dtype=[('a', '<i8'), ('b', '<i8')])
+    assert np.all(saved_arr == expected)
 
 
 def test_append_ndarray_with_field_shape(library):
@@ -135,6 +166,15 @@ def test_append_too_large_ndarray(library):
     assert np.all(np.concatenate([ndarr, ndarr]) == saved_arr)
 
 
+def test_empty_field_append_keeps_all_columns(library):
+    ndarr = np.array([(3, 5)], dtype=[('a', '<i'), ('b', '<i')])
+    ndarr2 = np.array([], dtype=[('a', '<i')])
+    library.write('MYARR', ndarr)
+    library.append('MYARR', ndarr2)
+    saved_arr = library.read('MYARR').data
+    assert np.all(saved_arr == np.array([(3, 5)], dtype=[('a', '<i'), ('b', '<i')]))
+
+
 def test_empty_append_promotes_dtype(library):
     ndarr = np.array(["a", "b", "c"])
     ndarr2 = np.array([])
@@ -162,6 +202,14 @@ def test_empty_append_promotes_dtype3(library):
     library.append('MYARR', ndarr2)
     saved_arr = library.read('MYARR').data
     assert np.all(saved_arr == np.hstack((ndarr2, ndarr2)))
+
+
+def test_convert_to_structured_array(library):
+    arr = np.ones(100, dtype='int64')
+    library.write('MYARR', arr)
+    arr = np.array([(6,)], dtype=[('a', '<i8')])
+    with pytest.raises(ValueError):
+        library.append('MYARR', arr)
 
 
 def test_empty_append_concat_and_rewrite(library):
@@ -249,3 +297,12 @@ def test_append_after_failed_append(library):
 
     assert np.all(ndarr == library.read('MYARR', as_of=v1.version).data)
     assert np.all(np.concatenate([ndarr, sliver2]) == library.read('MYARR', as_of=v3.version).data)
+
+
+def test_append_reorder_columns(library):
+    foo = np.array([(1,2)], dtype=np.dtype([('a', 'u1'), ('b', 'u1')]))
+    library.write('MYARR', foo)
+    foo = np.array([(1,2)], dtype=np.dtype([('b', 'u1'), ('a', 'u1')]))
+    library.append('MYARR', foo)
+
+    assert np.all(library.read('MYARR').data == np.array([(2, 1), (1, 2)], dtype=[('b', 'u1'), ('a', 'u1')]))

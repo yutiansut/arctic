@@ -6,6 +6,7 @@ from numpy.testing import assert_equal
 from pymongo.server_type import SERVER_TYPE
 import pytest
 
+from arctic._util import mongo_count
 from arctic.store._ndarray_store import NdarrayStore, _APPEND_COUNT
 from arctic.store.version_store import register_versioned_storage
 
@@ -13,6 +14,18 @@ from tests.integration.store.test_version_store import _query
 
 
 register_versioned_storage(NdarrayStore)
+
+
+def test_write_new_column_name_to_arctic_1_40_data(ndarray_store_with_uncompressed_write):
+    store = ndarray_store_with_uncompressed_write['store']
+    symbol = ndarray_store_with_uncompressed_write['symbol']
+
+    arr = store.read(symbol).data
+    new_arr = np.array(list(arr) + [(2,)], dtype=[('fgh', '<i8')])
+
+    store.write(symbol, new_arr)
+
+    assert np.all(store.read(symbol).data == new_arr)
 
 
 def test_save_read_simple_ndarray(library):
@@ -45,7 +58,7 @@ def test_save_and_resave_reuses_chunks(library):
         library.write('MYARR', ndarr)
         saved_arr = library.read('MYARR').data
         assert np.all(ndarr == saved_arr)
-        orig_chunks = library._collection.count()
+        orig_chunks = mongo_count(library._collection)
         assert orig_chunks == 9
 
         # Concatenate more values
@@ -58,11 +71,11 @@ def test_save_and_resave_reuses_chunks(library):
 
         # Should contain the original chunks, but not double the number
         # of chunks
-        new_chunks = library._collection.count()
+        new_chunks = mongo_count(library._collection)
         assert new_chunks == 11
 
         # We hit the update (rather than upsert) code path
-        assert library._collection.find({'parent': {'$size': 2}}).count() == 7
+        assert mongo_count(library._collection, filter={'parent': {'$size': 2}}) == 7
 
 
 def test_save_read_big_2darray(library):
@@ -122,6 +135,15 @@ def test_save_read_large_ndarray(library):
     library.write('MYARR', ndarr)
     saved_arr = library.read('MYARR').data
     assert np.all(ndarr == saved_arr)
+
+
+def test_mutable_ndarray(library):
+    dtype = np.dtype([('abc', 'int64')])
+    ndarr = np.arange(32).view(dtype=dtype)
+    ndarr.setflags(write=True)
+    library.write('MYARR', ndarr)
+    saved_arr = library.read('MYARR').data
+    assert saved_arr.flags['WRITEABLE']
 
 
 @pytest.mark.xfail(reason="delete_version not safe with append...")
