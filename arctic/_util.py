@@ -5,14 +5,18 @@ import pymongo
 from pandas import DataFrame
 from pandas.util.testing import assert_frame_equal
 
+from ._config import FW_POINTERS_CONFIG_KEY, FwPointersCfg
 
 logger = logging.getLogger(__name__)
 
-MAX_DOCUMENT_SIZE = int(pymongo.common.MAX_BSON_SIZE * 0.8)
 NP_OBJECT_DTYPE = np.dtype('O')
 
 # Avoid import-time extra logic
 _use_new_count_api = None
+
+
+def get_fwptr_config(version):
+    return FwPointersCfg[version.get(FW_POINTERS_CONFIG_KEY, FwPointersCfg.DISABLED.name)]
 
 
 def _detect_new_count_api():

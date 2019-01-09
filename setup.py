@@ -17,11 +17,11 @@
 # USA
 
 import logging
-from setuptools import setup
-from setuptools import find_packages
-from setuptools.command.test import test as TestCommand
 import sys
 
+from setuptools import find_packages
+from setuptools import setup
+from setuptools.command.test import test as TestCommand
 
 # Convert Markdown to RST for PyPI
 # http://stackoverflow.com/a/26737672
@@ -65,7 +65,7 @@ class PyTest(TestCommand):
 
 setup(
     name="arctic",
-    version="1.73.0",
+    version="1.74.0",
     author="Man AHL Technology",
     author_email="ManAHLTech@ahl.com",
     description=("AHL Research Versioned TimeSeries and Tick store"),
@@ -81,6 +81,7 @@ setup(
                    ],
     install_requires=["decorator",
                       "enum-compat",
+                      "futures; python_version == '2.7'",
                       "mockextras",
                       "pandas",
                       "pymongo>=3.6.0",
@@ -89,6 +90,7 @@ setup(
                       "tzlocal",
                       "lz4"
                      ],
+    # Note: pytest >= 4.1.0 is not compatible with pytest-cov < 2.6.1.
     tests_require=["mock",
                    "mockextras",
                    "pytest",

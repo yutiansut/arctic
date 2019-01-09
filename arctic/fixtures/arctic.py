@@ -6,9 +6,9 @@ import bson
 import pytest as pytest
 
 from .. import arctic as m
+from ..chunkstore.chunkstore import CHUNK_STORE_TYPE
 from ..store.bitemporal_store import BitemporalStore
 from ..tickstore.tickstore import TICK_STORE_TYPE
-from ..chunkstore.chunkstore import CHUNK_STORE_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ def arctic(mongo_server):
 def arctic_secondary(mongo_server, arctic):
     arctic = m.Arctic(mongo_host=mongo_server.api, allow_secondary=True)
     return arctic
+
 
 @pytest.fixture(scope="function")
 def multicolumn_store_with_uncompressed_write(mongo_server):

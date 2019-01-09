@@ -1,4 +1,3 @@
-import os
 import logging
 from multiprocessing.pool import ThreadPool
 
@@ -8,25 +7,12 @@ try:
 except ImportError as e:
     from lz4 import compress as lz4_compress, compressHC as lz4_compressHC, decompress as lz4_decompress
 
+# ENABLE_PARALLEL mutated in global_scope. Do not remove.
+from ._config import ENABLE_PARALLEL, LZ4_HIGH_COMPRESSION, LZ4_WORKERS, LZ4_N_PARALLEL, LZ4_MINSZ_PARALLEL, \
+    BENCHMARK_MODE  # noqa # pylint: disable=unused-import
 
 logger = logging.getLogger(__name__)
 
-# switch to parallel LZ4 compress (and potentially other parallel stuff), Default True
-ENABLE_PARALLEL = not os.environ.get('DISABLE_PARALLEL')
-LZ4_HIGH_COMPRESSION = bool(os.environ.get('LZ4_HIGH_COMPRESSION'))
-
-# For a guide on how to tune the following parameters, read:
-#     arctic/benchmarks/lz4_tuning/README.txt
-# The size of the compression thread pool.
-# Rule of thumb: use 2 for non HC (VersionStore/NDarrayStore/PandasStore, and 8 for HC (TickStore).
-LZ4_WORKERS = os.environ.get('LZ4_WORKERS', 2)
-# The minimum required number of chunks to use parallel compression
-LZ4_N_PARALLEL = os.environ.get('LZ4_N_PARALLEL', 16)
-# Minimum data size to use parallel compression
-LZ4_MINSZ_PARALLEL = os.environ.get('LZ4_MINSZ_PARALLEL', 0.5*1024**2)  # 0.5 MB
-
-# Enable this when you run the benchmark_lz4.py
-BENCHMARK_MODE = False
 
 _compress_thread_pool = None
 
@@ -42,7 +28,7 @@ def enable_parallel_lz4(mode):
     """
     global ENABLE_PARALLEL
     ENABLE_PARALLEL = bool(mode)
-    logger.info("Setting parallelisation mode to {}".format("multithread" if mode else "singlethread"))
+    logger.info("Setting parallelisation mode to {}".format("multi-threaded" if mode else "single-threaded"))
 
 
 def set_compression_pool_size(pool_size):
@@ -93,8 +79,10 @@ def compress_array(str_list, withHC=LZ4_HIGH_COMPRESSION):
 
     do_compress = lz4_compressHC if withHC else lz4_compress
 
-    use_parallel = ENABLE_PARALLEL and withHC or \
-                   len(str_list) > LZ4_N_PARALLEL and len(str_list[0]) > LZ4_MINSZ_PARALLEL
+    def can_parallelize_strlist(strlist):
+        return len(strlist) > LZ4_N_PARALLEL and len(strlist[0]) > LZ4_MINSZ_PARALLEL
+
+    use_parallel = (ENABLE_PARALLEL and withHC) or can_parallelize_strlist(str_list)
 
     if BENCHMARK_MODE or use_parallel:
         if _compress_thread_pool is None:
@@ -102,7 +90,7 @@ def compress_array(str_list, withHC=LZ4_HIGH_COMPRESSION):
         return _compress_thread_pool.map(do_compress, str_list)
 
     return [do_compress(s) for s in str_list]
-    
+
 
 def compress(_str):
     """
